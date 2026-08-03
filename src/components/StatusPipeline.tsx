@@ -1,0 +1,44 @@
+import { TICKET_STATUS_ORDER, type TicketStatus } from '../types';
+
+export function StatusPipeline({ status, accent }: { status: TicketStatus; accent: string }) {
+  const currentIdx = TICKET_STATUS_ORDER.indexOf(status);
+
+  return (
+    <div className="flex items-center">
+      {TICKET_STATUS_ORDER.map((step, idx) => {
+        const done = idx < currentIdx;
+        const active = idx === currentIdx;
+        const reached = idx <= currentIdx;
+        return (
+          <div key={step} className="flex items-center last:flex-none flex-1">
+            <div className="flex flex-col items-center gap-1">
+              <div
+                className="flex h-5 w-5 items-center justify-center rounded-full border-2 text-[9px] font-bold transition-colors duration-500"
+                style={{
+                  borderColor: reached ? accent : '#d1d5db',
+                  backgroundColor: reached ? accent : '#fff',
+                  color: reached ? '#fff' : '#9ca3af',
+                }}
+              >
+                {done ? '✓' : idx + 1}
+              </div>
+              <span
+                className={`w-16 text-center text-[9.5px] leading-tight ${
+                  active ? 'font-semibold text-[#111827]' : 'text-[#6b7280]'
+                }`}
+              >
+                {step}
+              </span>
+            </div>
+            {idx < TICKET_STATUS_ORDER.length - 1 && (
+              <div
+                className="mx-0.5 mb-4 h-0.5 flex-1 transition-colors duration-700"
+                style={{ backgroundColor: idx < currentIdx ? accent : '#e5e7eb' }}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
