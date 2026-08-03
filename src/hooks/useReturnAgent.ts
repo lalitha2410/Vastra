@@ -190,7 +190,7 @@ export function useReturnAgent() {
             id: uid(),
             role: 'agent',
             text: isQuota
-              ? `Sorry, the assistant's API rate limit has been hit right now, so I can't respond. (Check the ${providerName} key's rate limits/credits.)`
+              ? `We've hit ${providerName}'s free-tier rate limit for a moment — it clears within a minute. Hit Reset and try again shortly.`
               : "Sorry, I'm having trouble reaching the assistant right now. Please try again in a moment.",
             timestamp: Date.now(),
           },
