@@ -30,47 +30,93 @@ Two things a buyer should walk away believing:
 
 ```bash
 npm install
-cp .env.example .env   # then add your OpenRouter API key
+cp .env.example .env   # then add an API key for whichever provider you're using
 npm run dev
 ```
 
-Get a free key at [OpenRouter](https://openrouter.ai/keys) and set:
+**Two interchangeable providers**, switched with one env var:
 
 ```
+VITE_LLM_PROVIDER=groq          # or "openrouter" — defaults to groq if unset
+VITE_GROQ_API_KEY=your_key_here
 VITE_OPENROUTER_API_KEY=your_key_here
 ```
 
-If the key is missing, the app shows a clear in-UI message instead of
-crashing (see `src/components/ApiKeyNotice.tsx`). No backend, no database —
-everything runs client-side with state held in React, calling OpenRouter's
-`/chat/completions` API directly from the browser.
+You only need a key for whichever provider is active — the app reads
+`VITE_LLM_PROVIDER` and only calls that one. Both keys can sit in `.env`
+at once (harmless) so switching providers is just changing one line and
+restarting `npm run dev`, no re-entering keys.
 
-**Which model, and why:** the agent runs on `openai/gpt-oss-20b:free` via
-OpenRouter. This isn't a stylistic pick — most of OpenRouter's free-tier
-models do **not** support function/tool calling at all, and this whole demo
-is worthless without real tool calling (that's the entire "tools decide,
-the model converses" pitch). `gpt-oss-20b` is one of the few free models
-whose `supported_parameters` include `tools`/`tool_choice`, and it's an
-OpenAI-released open-weight model (Apache 2.0) so behaviour is
-well-documented.
+- **Groq** (default): free key at [console.groq.com/keys](https://console.groq.com/keys).
+- **OpenRouter**: free key at [openrouter.ai/keys](https://openrouter.ai/keys).
 
-**We tested the paid variant (`openai/gpt-oss-20b`, no `:free` suffix) and
-deliberately did not switch to it.** It's the same weights but a
-meaningfully different result: a controlled 5-trial head-to-head (identical
-prompt, tools, `reasoning: {effort:'low'}`) showed paid averaging ~1.2s per
-call vs. free's ~6.8s with two 12-14s queuing spikes — a real latency win.
-But OpenRouter routes the two variants to different upstream providers
-(free → Darkbloom, paid → DeepInfra), and a follow-up 4-trial probe of the
-same opening turn found the paid/DeepInfra path dropped mid-tool-chain 3
-times out of 4 — the model would narrate "let me check the sizes, one
-moment…" without actually calling `getAvailableSizes`, leaving the
-conversation stalled until the customer said something else. The free
-variant chained correctly in every run across two full test passes. Faster
-isn't better if it's less reliable at the one thing this demo has to prove
-— reliable tool chaining is the entire pitch, more important than shaving
-a few seconds. If OpenRouter's paid routing improves later, or you want to
-re-test, the model string is one line in `src/lib/llmProvider.ts` — nothing
-else in the app needs to change (see "Design decisions" below).
+If the active provider's key is missing, the app shows a clear in-UI
+message instead of crashing (see `src/components/ApiKeyNotice.tsx`). No
+backend, no database — everything runs client-side with state held in
+React, calling the provider's `/chat/completions` API directly from the
+browser.
+
+**Which model, and why:** both providers run the exact same model —
+`openai/gpt-oss-20b` — deliberately, not by coincidence. Tool calling is
+non-negotiable (most free-tier models on either provider don't support it
+at all), and having already validated this specific model's tool-chaining
+behavior extensively against our system prompt (see below), keeping the
+weights identical when adding a second provider means the only variable
+that changes is the hosting infrastructure — not the model's judgement.
+
+- **Groq** (`openai/gpt-oss-20b`, no backend suffix) — added after
+  OpenRouter's free tier hit its 50-request/day account-level cap
+  mid-testing (a hard wall, not a per-minute throttle — it doesn't clear
+  until the daily reset or a credit top-up). Groq's LPU inference is also
+  substantially faster, which incidentally helps the separate latency
+  work already done (see "Design decisions").
+- **OpenRouter** (`openai/gpt-oss-20b:free`) — the original provider. Its
+  free-tier daily cap is real (see above) but the model is well-validated
+  there specifically: two full multi-scenario test passes with zero
+  broken tool chains.
+
+**We tested OpenRouter's paid variant (`openai/gpt-oss-20b`, no `:free`
+suffix) and deliberately did not switch to it.** Same weights, meaningfully
+different result: a controlled 5-trial head-to-head (identical prompt,
+tools, `reasoning: {effort:'low'}`) showed paid averaging ~1.2s per call
+vs. free's ~6.8s with two 12-14s queuing spikes — a real latency win. But
+OpenRouter routes the two variants to different upstream providers (free →
+Darkbloom, paid → DeepInfra), and a follow-up 4-trial probe of the same
+opening turn found the paid/DeepInfra path dropped mid-tool-chain 3 times
+out of 4 — the model would narrate "let me check the sizes, one moment…"
+without actually calling `getAvailableSizes`, leaving the conversation
+stalled until the customer said something else. Faster isn't better if
+it's less reliable at the one thing this demo has to prove. The general
+lesson carries to Groq too: a provider or infra switch is a *behavior*
+change, not just a speed change, even at identical model weights — worth
+a few test conversations before trusting a new provider in a live demo,
+which is exactly what we did before relying on Groq (see below).
+
+To add a third provider or change either model string, everything is in
+`src/lib/llmProvider.ts` — nothing else in the app needs to change (see
+"Design decisions" below).
+
+## Deploying to Vercel
+
+No backend and no client-side routing, so Vercel's zero-config Vite preset
+is sufficient — no `vercel.json` needed. Build command `npm run build`
+(`tsc -b && vite build`), output directory `dist`, both auto-detected.
+
+1. Push this repo to GitHub (see below).
+2. [vercel.com/new](https://vercel.com/new) → import the repo.
+3. **Add the env vars before the first build**: Project Settings →
+   Environment Variables → `VITE_LLM_PROVIDER` (`groq` or `openrouter`)
+   and the matching `VITE_GROQ_API_KEY` or `VITE_OPENROUTER_API_KEY`,
+   checked for Production/Preview/Development. Vite inlines `VITE_*` vars
+   at *build* time, so a missing key means the deployed build falls back
+   to the in-app "API key missing" screen, not a crash — but it has to be
+   set before you build, not after.
+4. Deploy. Every push to the connected branch redeploys automatically.
+
+The key ends up in the client-side JS bundle by design (no backend to hide
+it behind) — fine for a demo you control access to, but set a spend cap on
+the key (Settings → Keys, on either provider) if the URL will be shared
+beyond a live call.
 
 ### Live demo controls
 
@@ -86,11 +132,12 @@ else in the app needs to change (see "Design decisions" below).
 ## What's real vs. mocked
 
 **Real:**
-- OpenRouter (`openai/gpt-oss-20b:free`) function calling drives the entire
-  conversation — order lookup, eligibility checks, size lookup, pickup
-  slots, and ticket creation are actual tool calls the model makes, not
-  scripted branching. Responses stream token-by-token, and the ops panel
-  shows which tool is executing in real time as the model works.
+- Function calling (Groq or OpenRouter, both running `openai/gpt-oss-20b`
+  — see Setup) drives the entire conversation — order lookup, eligibility
+  checks, size lookup, pickup slots, and ticket creation are actual tool
+  calls the model makes, not scripted branching. Responses stream
+  token-by-token, and the ops panel shows which tool is executing in real
+  time as the model works.
 - The policy engine (`src/lib/policy.ts`) — return-window and final-sale
   logic runs as plain, unit-testable functions against the order data.
 - App state — the ticket list, its status pipeline, and the dashboard stats
@@ -141,12 +188,16 @@ the only module that knows an LLM vendor exists at all — it exposes
 `hasApiKey`, `startAgentChat`, and `sendAgentMessage`, and everything else
 (the tools, the policy engine, `useReturnAgent.ts`, every component) talks
 to those three functions, never to a vendor SDK or HTTP client directly.
-This app has already swapped providers once during development (Gemini →
-OpenRouter, after a quota issue on the Gemini side), and the migration
-touched exactly one file plus the env var name — the tool declarations,
-the conversation flow, and the ops dashboard wiring were all untouched.
-That's the point of the boundary: a vendor's pricing, quota, or API
-changes should never be a multi-file refactor.
+This app has swapped or added a provider twice during development (Gemini
+→ OpenRouter after a quota issue, then OpenRouter + Groq as a second,
+switchable provider after OpenRouter's free tier hit its daily cap
+mid-testing) and both times the change touched exactly this file plus env
+var names — the tool declarations, the conversation flow, and the ops
+dashboard wiring were untouched both times. That's the point of the
+boundary: a vendor's pricing, quota, or API changes should never be a
+multi-file refactor, and needing a *second* provider on short notice
+(testing tonight, quota exhausted) is exactly the scenario this boundary
+was built for.
 
 **Why chat formatting is sanitized in code, not just prompted.** The system
 prompt asks the model to use WhatsApp's `*single-asterisk*` bold instead of
@@ -163,10 +214,10 @@ instruction.
 
 ## Stack
 
-Vite + React + TypeScript + Tailwind CSS v4, OpenRouter's OpenAI-compatible
-REST API (`openai/gpt-oss-20b:free`, streamed via plain `fetch` — no SDK),
-no backend, no state management library — plain React state in
-`src/hooks/useReturnAgent.ts`.
+Vite + React + TypeScript + Tailwind CSS v4, Groq or OpenRouter's
+OpenAI-compatible REST APIs (`openai/gpt-oss-20b`, streamed via plain
+`fetch` — no SDK), no backend, no state management library — plain React
+state in `src/hooks/useReturnAgent.ts`.
 
 ## Project structure
 
@@ -178,7 +229,7 @@ src/
   data/scenarios.ts       # scripted "Play scenario" openers
   lib/policy.ts           # deterministic eligibility rules
   lib/tools.ts            # pure tool implementations (lookupOrder, etc.)
-  lib/llmProvider.ts      # the ONLY file that knows the LLM vendor; streaming OpenRouter client + function-calling loop
+  lib/llmProvider.ts      # the ONLY file that knows the LLM vendor(s); streaming Groq/OpenRouter client + function-calling loop
   lib/systemPrompt.ts     # conversational script (not policy)
   lib/formatText.ts       # sanitizes model output to WhatsApp formatting (code enforces, not the prompt)
   hooks/useReturnAgent.ts # central state: chat, tickets, brand, stats, live tool activity

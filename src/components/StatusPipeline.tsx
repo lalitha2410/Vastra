@@ -42,3 +42,35 @@ export function StatusPipeline({ status, accent }: { status: TicketStatus; accen
     </div>
   );
 }
+
+/** Dense variant for a table row: dots + connecting line only, no per-step
+ * labels (a labeled dot per step doesn't fit a table row), plus a single
+ * caption for the current step so the row still states its status in words. */
+export function StatusPipelineCompact({ status, accent }: { status: TicketStatus; accent: string }) {
+  const currentIdx = TICKET_STATUS_ORDER.indexOf(status);
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <div className="flex items-center">
+        {TICKET_STATUS_ORDER.map((step, idx) => {
+          const reached = idx <= currentIdx;
+          return (
+            <div key={step} className="flex items-center">
+              <div
+                className="h-1.75 w-1.75 rounded-full transition-colors duration-500"
+                style={{ backgroundColor: reached ? accent : '#e0e2e6' }}
+              />
+              {idx < TICKET_STATUS_ORDER.length - 1 && (
+                <div
+                  className="h-0.5 w-2.5 transition-colors duration-700"
+                  style={{ backgroundColor: idx < currentIdx ? accent : '#e0e2e6' }}
+                />
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <span className="whitespace-nowrap text-[11px] font-medium text-[#374151]">{status}</span>
+    </div>
+  );
+}

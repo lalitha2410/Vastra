@@ -1,8 +1,26 @@
 import type { ReturnTicket } from '../types';
 import { RETURN_REASON_LABELS } from '../types';
-import { StatusPipeline } from './StatusPipeline';
+import { StatusPipelineCompact } from './StatusPipeline';
 
 const rupee = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
+
+// Shared column widths so the header and every row line up exactly.
+const GRID_COLS = 'grid-cols-[104px_112px_minmax(160px,1fr)_112px_188px_150px]';
+
+export function TicketTableHeader() {
+  return (
+    <div
+      className={`grid ${GRID_COLS} gap-3 border-b border-[#e2e4e8] px-3 py-1.5 text-[10.5px] font-semibold uppercase tracking-wide text-[#6b7280]`}
+    >
+      <span>Ticket</span>
+      <span>Customer</span>
+      <span>Item</span>
+      <span>Resolution</span>
+      <span>Status</span>
+      <span className="text-right">Pickup / Amount</span>
+    </div>
+  );
+}
 
 export function TicketCard({ ticket, accent }: { ticket: ReturnTicket; accent: string }) {
   const isExchange = ticket.resolution === 'exchange';
@@ -11,46 +29,38 @@ export function TicketCard({ ticket, accent }: { ticket: ReturnTicket; accent: s
     <div
       data-testid="ticket-card"
       data-status={ticket.status}
-      className="wa-bubble-in rounded-md border border-[#e2e4e8] bg-white p-3 shadow-sm"
+      className={`wa-bubble-in grid ${GRID_COLS} items-center gap-3 border-b border-[#eef0f2] bg-white px-3 py-2 text-[12px] last:border-b-0 hover:bg-[#fafafa]`}
     >
-      <div className="mb-2.5 flex items-start justify-between gap-2">
-        <div className="flex items-center gap-2.5">
-          <img
-            src={ticket.itemImageUrl}
-            alt={ticket.itemName}
-            className="h-11 w-9 rounded border border-[#e2e4e8] object-cover"
-          />
-          <div>
-            <p className="text-[13px] font-semibold text-[#111827]">
-              {ticket.ticketId}
-              <span className="ml-2 font-normal text-[#6b7280]">{ticket.orderId}</span>
-            </p>
-            <p className="text-[12.5px] text-[#374151]">{ticket.itemName}</p>
-            <p className="text-[11.5px] text-[#6b7280]">{ticket.customerName}</p>
-          </div>
-        </div>
-        <div className="flex flex-col items-end gap-1">
-          <span
-            className="rounded-full px-2 py-0.5 text-[10.5px] font-semibold"
-            style={
-              isExchange
-                ? { backgroundColor: `${accent}1a`, color: accent }
-                : { backgroundColor: '#F3F4F6', color: '#4B5563' }
-            }
-          >
-            {isExchange ? `Exchange → ${ticket.exchangeSize}` : 'Refund'}
-          </span>
-          <span className="text-[11px] text-[#6b7280]">{RETURN_REASON_LABELS[ticket.reason]}</span>
-        </div>
+      <div className="min-w-0">
+        <p className="truncate text-[12.5px] font-semibold text-[#111827]">{ticket.ticketId}</p>
+        <p className="truncate text-[11px] text-[#6b7280]">{ticket.orderId}</p>
       </div>
 
-      <StatusPipeline status={ticket.status} accent={accent} />
+      <p className="truncate text-[12px] text-[#374151]">{ticket.customerName}</p>
 
-      <div className="mt-2.5 flex items-center justify-between border-t border-[#f1f2f4] pt-2 text-[11.5px] text-[#4b5563]">
-        <span>{ticket.slot?.label ?? '—'}</span>
-        <span className="font-medium text-[#111827]">
-          {isExchange ? 'No refund · item swapped' : `${rupee.format(ticket.refundAmount)} → ${ticket.refundDestination}`}
-        </span>
+      <div className="min-w-0">
+        <p className="truncate text-[12px] text-[#111827]">{ticket.itemName}</p>
+        <p className="truncate text-[11px] text-[#6b7280]">{RETURN_REASON_LABELS[ticket.reason]}</p>
+      </div>
+
+      <span
+        className="inline-block w-fit rounded px-1.5 py-0.5 text-[10.5px] font-semibold"
+        style={
+          isExchange
+            ? { backgroundColor: `${accent}1a`, color: accent }
+            : { backgroundColor: '#F3F4F6', color: '#4B5563' }
+        }
+      >
+        {isExchange ? `Exchange → ${ticket.exchangeSize}` : 'Refund'}
+      </span>
+
+      <StatusPipelineCompact status={ticket.status} accent={accent} />
+
+      <div className="text-right">
+        <p className="truncate text-[11.5px] text-[#4b5563]">{ticket.slot?.label ?? '—'}</p>
+        <p className="truncate text-[12px] font-medium text-[#111827]">
+          {isExchange ? 'No refund' : rupee.format(ticket.refundAmount)}
+        </p>
       </div>
     </div>
   );

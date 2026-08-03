@@ -5,33 +5,81 @@ import { buildSystemInstruction } from './systemPrompt';
  * The ONLY module in the app that knows which LLM vendor is behind the
  * agent. `useReturnAgent.ts` (state), `tools.ts` (executors) and
  * `policy.ts` (eligibility rules) never import from here directly except
- * for the exports below — swapping vendors again later means rewriting
- * this one file, not touching the hook, the tools, or the UI.
+ * for the exports below — swapping vendors, or adding a second one, means
+ * rewriting this one file, not touching the hook, the tools, or the UI.
  *
- * Currently: OpenRouter's OpenAI-compatible /chat/completions endpoint,
- * streaming, model `openai/gpt-oss-20b:free`. Picked because it's one of
- * the few OpenRouter free-tier models whose `supported_parameters` list
- * includes `tools`/`tool_choice` (most free models don't support function
- * calling at all).
+ * Two providers, both OpenAI-compatible chat-completions APIs, switched
+ * via VITE_LLM_PROVIDER=groq|openrouter (default groq):
  *
- * The paid `openai/gpt-oss-20b` (no `:free` suffix) is meaningfully faster
- * (~1.2s vs ~6.8s mean per call, no 12-14s queuing spikes — see README) but
- * is NOT the default: it's served by a different upstream provider
- * (DeepInfra vs. the free tier's Darkbloom), and a 4-trial probe of the
- * exact same opening turn found it dropped mid-tool-chain 3 times out of
- * 4 — narrating "let me check the sizes, one moment…" without actually
- * calling getAvailableSizes, leaving the conversation stalled until the
- * customer says something. The free variant chained correctly in every
- * run across two full test passes. Speed regressed reliability here, and
- * reliable tool chaining is the entire pitch — see README "Design
- * decisions" before switching this.
+ * - Groq (`openai/gpt-oss-20b`) — added as a second provider after
+ *   OpenRouter's free tier hit its 50-request/day account-level cap
+ *   mid-testing. Deliberately the SAME model weights already validated
+ *   on OpenRouter (see below), just on Groq's hosting, to keep the one
+ *   variable that matters — tool-chaining reliability — as controlled as
+ *   possible when switching infrastructure. Groq's LPU inference is also
+ *   materially faster, which happens to help the latency problem too.
+ *
+ * - OpenRouter (`openai/gpt-oss-20b:free`) — the original provider.
+ *   Picked because it's one of the few OpenRouter free-tier models whose
+ *   `supported_parameters` list includes `tools`/`tool_choice` (most free
+ *   models don't support function calling at all). The paid, no-`:free`
+ *   variant is faster but is NOT used — see README "Design decisions":
+ *   it's served by a different upstream provider and a 4-trial probe
+ *   found it dropped mid-tool-chain 3 times out of 4. Reliable tool
+ *   chaining outranks speed here.
  */
 
-export const OPENROUTER_MODEL = 'openai/gpt-oss-20b:free';
-const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+type LlmProviderName = 'groq' | 'openrouter';
+
+interface ProviderSpec {
+  url: string;
+  model: string;
+  apiKey: string | undefined;
+  headers: Record<string, string>;
+  /** Same idea on both providers — trade reasoning depth for latency,
+   * since this agent only needs to pick the right tool and phrase a short
+   * reply — but the two APIs spell it differently: OpenRouter wants a
+   * nested `reasoning` object, Groq (following OpenAI's own gpt-oss param
+   * naming directly) wants a flat `reasoning_effort` string. */
+  reasoningParam: Record<string, unknown>;
+}
+
+function getProviderName(): LlmProviderName {
+  const raw = (import.meta.env.VITE_LLM_PROVIDER ?? '').trim().toLowerCase();
+  return raw === 'openrouter' ? 'openrouter' : 'groq';
+}
+
+function getProviderSpec(): ProviderSpec {
+  const provider = getProviderName();
+  if (provider === 'openrouter') {
+    const key = import.meta.env.VITE_OPENROUTER_API_KEY;
+    return {
+      url: 'https://openrouter.ai/api/v1/chat/completions',
+      model: 'openai/gpt-oss-20b:free',
+      apiKey: key,
+      headers: {
+        Authorization: `Bearer ${key ?? ''}`,
+        'Content-Type': 'application/json',
+        'X-Title': 'Returns Agent WhatsApp Demo',
+      },
+      reasoningParam: { reasoning: { effort: 'low' } },
+    };
+  }
+  const key = import.meta.env.VITE_GROQ_API_KEY;
+  return {
+    url: 'https://api.groq.com/openai/v1/chat/completions',
+    model: 'openai/gpt-oss-20b',
+    apiKey: key,
+    headers: {
+      Authorization: `Bearer ${key ?? ''}`,
+      'Content-Type': 'application/json',
+    },
+    reasoningParam: { reasoning_effort: 'low' },
+  };
+}
 
 export function getApiKey(): string | undefined {
-  return import.meta.env.VITE_OPENROUTER_API_KEY;
+  return getProviderSpec().apiKey;
 }
 
 export function hasApiKey(): boolean {
@@ -39,9 +87,35 @@ export function hasApiKey(): boolean {
   return Boolean(key && key.trim().length > 0);
 }
 
-// --- OpenAI-style tool declarations (OpenRouter's chat completions API is
-// OpenAI-compatible, so tools are described the same way regardless of
-// which underlying model answers). ---
+/** Display-only info about whichever provider is active, so the UI (missing-key
+ * screen, chat placeholder, error text) never hardcodes a vendor name — it asks
+ * this module, same as everything else that needs to know which vendor is live. */
+export interface ProviderDisplayInfo {
+  name: string;
+  keyUrl: string;
+  envVarName: string;
+}
+
+const PROVIDER_DISPLAY: Record<LlmProviderName, ProviderDisplayInfo> = {
+  groq: {
+    name: 'Groq',
+    keyUrl: 'https://console.groq.com/keys',
+    envVarName: 'VITE_GROQ_API_KEY',
+  },
+  openrouter: {
+    name: 'OpenRouter',
+    keyUrl: 'https://openrouter.ai/keys',
+    envVarName: 'VITE_OPENROUTER_API_KEY',
+  },
+};
+
+export function getActiveProvider(): ProviderDisplayInfo {
+  return PROVIDER_DISPLAY[getProviderName()];
+}
+
+// --- OpenAI-style tool declarations (both providers' chat completions
+// APIs are OpenAI-compatible, so tools are described the same way
+// regardless of which one answers). ---
 
 interface JsonSchema {
   type: string;
@@ -158,7 +232,7 @@ interface ToolCall {
   function: { name: string; arguments: string };
 }
 
-interface OpenRouterMessage {
+interface ChatCompletionMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string | null;
   tool_calls?: ToolCall[];
@@ -167,11 +241,12 @@ interface OpenRouterMessage {
 
 /**
  * Stateless REST APIs need the caller to resend the whole transcript each
- * turn (unlike Gemini's stateful ChatSession) — this is just that
- * transcript, held for the lifetime of one conversation.
+ * turn (unlike Gemini's stateful ChatSession, from before this app's
+ * first provider migration) — this is just that transcript, held for the
+ * lifetime of one conversation.
  */
 export interface ChatSession {
-  messages: OpenRouterMessage[];
+  messages: ChatCompletionMessage[];
 }
 
 export function startAgentChat(brand: BrandConfig): ChatSession {
@@ -190,36 +265,30 @@ interface StreamResult {
  * into the chat). Tool-call argument fragments are accumulated by index
  * per OpenAI's streaming tool-call format and returned whole at the end,
  * since a tool can only be executed once its full arguments are known.
- *
- * `reasoning: { effort: 'low' }` trades reasoning depth for latency —
- * this agent only needs to pick the right tool and phrase a short reply,
- * not solve hard problems, so low effort is enough and meaningfully
- * faster (measured ~85% fewer reasoning tokens per call vs. default).
+ * The SSE format itself is identical across both providers (both are
+ * OpenAI-compatible), so only request construction is provider-specific.
  */
 async function streamChatCompletion(
-  messages: OpenRouterMessage[],
+  messages: ChatCompletionMessage[],
   onTextDelta?: (textSoFar: string) => void,
 ): Promise<StreamResult> {
-  const res = await fetch(OPENROUTER_URL, {
+  const spec = getProviderSpec();
+  const res = await fetch(spec.url, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${getApiKey() ?? ''}`,
-      'Content-Type': 'application/json',
-      'X-Title': 'Returns Agent WhatsApp Demo',
-    },
+    headers: spec.headers,
     body: JSON.stringify({
-      model: OPENROUTER_MODEL,
+      model: spec.model,
       messages,
       tools: toolDeclarations,
       tool_choice: 'auto',
-      reasoning: { effort: 'low' },
       stream: true,
+      ...spec.reasoningParam,
     }),
   });
 
   if (!res.ok || !res.body) {
     const body = await res.text().catch(() => '');
-    throw new Error(`OpenRouter request failed: ${res.status} ${res.statusText} ${body}`);
+    throw new Error(`${getProviderName()} request failed: ${res.status} ${res.statusText} ${body}`);
   }
 
   const reader = res.body.getReader();

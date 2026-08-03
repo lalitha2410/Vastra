@@ -3,6 +3,7 @@ import type { BrandConfig } from '../config/brand';
 import { getBrandById, vastraBrand } from '../config/brand';
 import type { ChatMessage, ReturnTicket, TicketStatus } from '../types';
 import {
+  getActiveProvider,
   hasApiKey,
   sendAgentMessage,
   startAgentChat,
@@ -178,7 +179,8 @@ export function useReturnAgent() {
         );
         setMessages((prev) => [...prev, { id: uid(), role: 'agent', text: reply, timestamp: Date.now() }]);
       } catch (err) {
-        console.error('OpenRouter request failed', err);
+        const providerName = getActiveProvider().name;
+        console.error(`${providerName} request failed`, err);
         const raw = err instanceof Error ? err.message : String(err);
         const lower = raw.toLowerCase();
         const isQuota = raw.includes('429') || lower.includes('quota') || lower.includes('rate limit');
@@ -188,7 +190,7 @@ export function useReturnAgent() {
             id: uid(),
             role: 'agent',
             text: isQuota
-              ? "Sorry, the assistant's API rate limit has been hit right now, so I can't respond. (Check the OpenRouter key's rate limits/credits.)"
+              ? `Sorry, the assistant's API rate limit has been hit right now, so I can't respond. (Check the ${providerName} key's rate limits/credits.)`
               : "Sorry, I'm having trouble reaching the assistant right now. Please try again in a moment.",
             timestamp: Date.now(),
           },
