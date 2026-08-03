@@ -35,3 +35,42 @@ export function sanitizeWhatsAppText(text: string): string {
     .replace(/\*{3,}/g, '**')
     .replace(/\*\*(.+?)\*\*/gs, '*$1*');
 }
+
+export interface TextSegment {
+  bold: boolean;
+  text: string;
+}
+
+/**
+ * Sanitizes, then splits into plain/bold segments for the renderer to turn
+ * into text nodes and <strong> — sanitizing alone only normalizes *which*
+ * asterisks are left in the string, it doesn't make WhatsApp's convention
+ * actually render as bold, so the previous version showed literal `*S*`
+ * on screen. This is the part that makes it real formatting.
+ *
+ * A single asterisk is only treated as an emphasis marker when it opens
+ * and closes on the *same* line with plain text in between (no nested
+ * asterisk, no crossing a newline) — deliberately narrow so it can't
+ * misfire on the numbered-emoji list style (1️⃣ 2️⃣ 3️⃣) or on an unpaired
+ * asterisk left over from something the sanitizer didn't recognize; those
+ * just fall through as plain text, unchanged.
+ */
+export function parseWhatsAppText(rawText: string): TextSegment[] {
+  const text = sanitizeWhatsAppText(rawText);
+  const segments: TextSegment[] = [];
+  const boldPattern = /\*([^\n*]+)\*/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = boldPattern.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ bold: false, text: text.slice(lastIndex, match.index) });
+    }
+    segments.push({ bold: true, text: match[1] });
+    lastIndex = boldPattern.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    segments.push({ bold: false, text: text.slice(lastIndex) });
+  }
+  return segments;
+}

@@ -1,8 +1,26 @@
 import type { ChatMessage } from '../types';
-import { sanitizeWhatsAppText } from '../lib/formatText';
+import { parseWhatsAppText } from '../lib/formatText';
 
 function formatTime(ts: number): string {
   return new Date(ts).toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit', hour12: true });
+}
+
+/** Renders WhatsApp's *single-asterisk* convention as actual bold, instead
+ * of leaving literal asterisks on screen — see formatText.ts. */
+function FormattedText({ text }: { text: string }) {
+  return (
+    <>
+      {parseWhatsAppText(text).map((seg, i) =>
+        seg.bold ? (
+          <strong key={i} className="font-semibold">
+            {seg.text}
+          </strong>
+        ) : (
+          seg.text
+        ),
+      )}
+    </>
+  );
 }
 
 /**
@@ -43,7 +61,9 @@ export function ChatBubble({ message }: { message: ChatMessage }) {
               : '-left-1.5 bg-white [clip-path:polygon(100%_0,0_0,100%_100%)]',
           ].join(' ')}
         />
-        <p className="whitespace-pre-wrap wrap-break-word">{sanitizeWhatsAppText(message.text)}</p>
+        <p className="whitespace-pre-wrap wrap-break-word">
+          <FormattedText text={message.text} />
+        </p>
         <span className="mt-0.5 flex items-center justify-end gap-1 text-[10.5px] text-[#667781] select-none">
           {formatTime(message.timestamp)}
           {isCustomer && <ReadTicks />}
@@ -65,7 +85,7 @@ export function StreamingBubble({ text }: { text: string }) {
           className="absolute -left-1.5 top-0 h-2.5 w-2.5 bg-white [clip-path:polygon(100%_0,0_0,100%_100%)]"
         />
         <p className="whitespace-pre-wrap wrap-break-word">
-          {sanitizeWhatsAppText(text)}
+          <FormattedText text={text} />
           <span className="stream-cursor ml-0.5 inline-block h-[13px] w-[2px] translate-y-[2px] bg-[#111b21]" />
         </p>
       </div>

@@ -390,6 +390,22 @@ export async function sendAgentMessage(
       continue;
     }
 
+    // A completion with no tool calls AND no text is not a valid reply —
+    // seen in practice as a Groq stream that returns 200 and a normal-
+    // looking SSE sequence, but gets cut off mid-generation by the
+    // per-minute token cap before any content token is emitted. Nothing
+    // upstream throws for this (the HTTP request genuinely succeeded), so
+    // without this check it silently resolves as an empty string and the
+    // hook renders a bubble with a timestamp and no text. Throwing here
+    // routes it through the hook's existing catch block instead, which
+    // already renders a proper rate-limit message — one failure path,
+    // not two.
+    if (!content.trim()) {
+      throw new Error(
+        `${getProviderName()} returned an empty completion (rate limit likely truncated the stream mid-generation)`,
+      );
+    }
+
     chat.messages.push({ role: 'assistant', content });
     return content;
   }
