@@ -1,12 +1,20 @@
 import { brands, type BrandConfig } from '../config/brand';
+import type { Channel } from '../types';
 
 interface TopBarProps {
   brand: BrandConfig;
+  channel: Channel;
   onBrandChange: (id: string) => void;
+  onChannelChange: (channel: Channel) => void;
   onReset: () => void;
 }
 
-export function TopBar({ brand, onBrandChange, onReset }: TopBarProps) {
+export function TopBar({ brand, channel, onBrandChange, onChannelChange, onReset }: TopBarProps) {
+  const channelButtonClass = (target: Channel) =>
+    `flex items-center gap-1 px-2 py-1 text-[11px] font-medium transition-colors sm:px-2.5 sm:text-xs ${
+      channel === target ? 'text-white' : 'text-[#3b4a54] hover:bg-[#f5f6f6]'
+    }`;
+
   return (
     <div className="flex items-center justify-between gap-2 border-b border-[#e2e4e8] bg-white px-2.5 py-1.5 sm:px-4 sm:py-2">
       <div className="flex min-w-0 items-center gap-2 sm:gap-2.5">
@@ -21,12 +29,34 @@ export function TopBar({ brand, onBrandChange, onReset }: TopBarProps) {
             {brand.name} Returns Agent
           </p>
           <p className="hidden truncate text-[11px] leading-tight text-[#6b7280] sm:block">
-            Live demo · chat + ops dashboard
+            Live demo · WhatsApp + Voice · ops dashboard
           </p>
         </div>
       </div>
 
       <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
+        {/* Channel switcher — the point of this demo, so it sits right next
+            to the brand switcher, not tucked away. Switching never resets
+            either channel's conversation or the shared ticket list. */}
+        <div className="flex overflow-hidden rounded-md border border-[#d1d7db]">
+          <button
+            type="button"
+            onClick={() => onChannelChange('whatsapp')}
+            className={channelButtonClass('whatsapp')}
+            style={channel === 'whatsapp' ? { backgroundColor: brand.colors.primary } : undefined}
+          >
+            💬 <span className="hidden sm:inline">WhatsApp</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => onChannelChange('voice')}
+            className={channelButtonClass('voice')}
+            style={channel === 'voice' ? { backgroundColor: brand.colors.primary } : undefined}
+          >
+            📞 <span className="hidden sm:inline">Voice</span>
+          </button>
+        </div>
+
         <select
           value={brand.id}
           onChange={(e) => onBrandChange(e.target.value)}

@@ -1,30 +1,40 @@
-# Returns Agent — WhatsApp Sales Demo
+# Returns Agent — Multi-Channel Sales Demo
 
 A sales-demo web app for showing enterprise prospects what an AI returns agent
-looks like when it's wired into WhatsApp on one side and their operations
-tooling on the other. Built to be walked through live on a call.
+looks like when it's wired into their customer channels on one side and their
+operations tooling on the other. One agent, two channels — WhatsApp and a
+live voice call — switchable instantly, backed by the same policy engine,
+tools, and ops console. Built to be walked through live on a call.
 
 ## What this demonstrates, and for whom
 
 **Audience:** ops / CX leaders at a D2C brand (fashion, pharmacy, or similar)
 evaluating whether an AI agent can safely handle returns conversations without
-turning into a support liability.
+turning into a support liability — and, specifically, whether that holds up
+across more than one channel without becoming two separate products to trust.
 
-**The pitch in one screen:** a customer messages about a return on WhatsApp
-(left). Every step of that conversation — order lookup, eligibility check,
+**The pitch in one screen:** a customer reaches out about a return — over
+WhatsApp, or on a live call, switchable with one click in the top bar (left
+panel). Every step of that conversation — order lookup, eligibility check,
 exchange vs. refund, pickup slot — shows up immediately as a structured ticket
-moving through a status pipeline on the ops console (right). A chat window
-alone only proves an LLM can hold a conversation. The split screen proves it
-lands in the systems an ops team actually watches.
+moving through a status pipeline on the ops console (right), regardless of
+which channel it came from. A chat window alone only proves an LLM can hold a
+conversation. The split screen proves it lands in the systems an ops team
+actually watches — and the channel switch proves that isn't tied to one
+integration.
 
-Two things a buyer should walk away believing:
+Three things a buyer should walk away believing:
 
 1. The agent can carry a real, branchy conversation (size exchange offered
    before refund, final-sale and window checks enforced, COD vs. prepaid
    refund routing) without the founder having to trust the model's judgement
-   on policy.
+   on policy — on a screen or on a phone call.
 2. Every one of those steps is a discrete, inspectable event in their
    operational system — not a black box.
+3. Adding a channel is not a rebuild. WhatsApp and voice share one policy
+   engine, one tool layer, and one ops backend — a ticket created on a call
+   shows up in the same table as one created over chat, because it's the
+   same table.
 
 ## Setup
 
@@ -120,33 +130,67 @@ beyond a live call.
 
 ### Live demo controls
 
-- **Play scenario** (top of the chat panel) — three scripted openers so the
-  conversation can run without typing on a call: size issue → exchange,
-  outside the return window, and a final-sale item.
+- **Channel switcher** (top bar, next to the brand switcher) — WhatsApp ⇄
+  Voice. Swaps the left panel between the chat UI and the call UI instantly.
+  Neither channel's conversation resets when you switch, and any tickets
+  already created stay in the ops console — that persistence is the point,
+  see "Design decisions" below.
+- **Play scenario** (top of the left panel, both channels) — three scripted
+  openers so the conversation can run without typing or talking on a call:
+  size issue → exchange, outside the return window, and a final-sale item.
+  In voice mode this fills in what the customer "says" via the API, without
+  needing an open mic.
 - **Brand switcher** (top bar) — swaps the whole app between two brand
   configs (a fashion brand and a pharmacy) to show this is a platform, not a
-  one-off build.
-- **Reset demo** — clears the conversation and ticket history and starts a
-  fresh chat session.
+  one-off build. Resets both channels (see below).
+- **Reset** — clears both channels' conversations and the shared ticket
+  history, ends any active call, and starts fresh.
+
+### Voice channel specifics
+
+- **Speech recognition and synthesis are browser APIs, not a service** — the
+  Web Speech API (`SpeechRecognition` / `speechSynthesis`), reliably
+  available in Chrome and Edge only. Firefox and Safari have partial or no
+  support; the panel detects this and falls back to a text input ("Or type
+  what you'd say…") that drives the exact same agent turn a spoken sentence
+  would, so the demo still works, it just isn't spoken.
+- **Microphone permission denial** is handled explicitly — a denied mic
+  shows a clear message and the text fallback stays available; it doesn't
+  break the call.
+- **Voice selection** degrades in tiers (see `src/lib/selectVoice.ts`): a
+  brand-preferred Indian-English voice if one is installed, then any
+  Indian-English voice, then any English voice, then the browser default.
+  Which voices exist is entirely OS/browser dependent, so this never assumes
+  a specific voice is present.
 
 ## What's real vs. mocked
 
 **Real:**
 - Function calling (Groq or OpenRouter, both running `openai/gpt-oss-20b`
-  — see Setup) drives the entire conversation — order lookup, eligibility
-  checks, size lookup, pickup slots, and ticket creation are actual tool
-  calls the model makes, not scripted branching. Responses stream
-  token-by-token, and the ops panel shows which tool is executing in real
-  time as the model works.
+  — see Setup) drives the entire conversation on **both channels** — order
+  lookup, eligibility checks, size lookup, pickup slots, and ticket creation
+  are actual tool calls the model makes, not scripted branching. Responses
+  stream token-by-token, and the ops panel shows which tool is executing in
+  real time as the model works.
+- Speech recognition and synthesis (voice channel) — the browser's actual
+  Web Speech API, not a mocked transcript. What you say is what gets
+  transcribed and sent to the model; what the model says is actually spoken
+  aloud, not just displayed.
 - The policy engine (`src/lib/policy.ts`) — return-window and final-sale
-  logic runs as plain, unit-testable functions against the order data.
+  logic runs as plain, unit-testable functions against the order data,
+  identical for both channels.
+- The duplicate-booking guard (`src/lib/tools.ts`) — a real check against
+  existing tickets, not a prompt instruction the model might forget.
 - App state — the ticket list, its status pipeline, and the dashboard stats
-  are all derived from the same React state the conversation mutates. Nothing
-  on the right panel is hand-wired to a specific chat message.
+  are all derived from the same React state both channels' conversations
+  mutate. Nothing on the right panel is hand-wired to a specific message.
 
 **Mocked:**
 - WhatsApp Business API — the chat UI is a WhatsApp-style thread, not a real
   WhatsApp Business Cloud API integration.
+- Telephony — the voice channel is browser speech APIs end-to-end; no real
+  phone call, no PSTN, no Twilio/telephony provider. "Call duration" is a
+  timer since you clicked Start Call, not a billed call leg.
 - Logistics/courier dispatch — pickup slots are static offers; there's no
   courier partner API.
 - Payments — refunds are never actually issued; "refund destination" is
@@ -169,12 +213,14 @@ is improvising refund policy — a return window or final-sale rule has to be
 something a QA engineer can unit-test independently of any prompt, and that a
 policy change doesn't require touching the LLM prompt at all.
 
-**Why the split screen.** The chat panel proves the agent can converse. The
-ops panel proves the conversation is actually operational data: a ticket with
-an ID, a status, a customer, and a pipeline that moves. That's the difference
-between "cool chatbot demo" and "this replaces part of my support queue." The
-two panels are never collapsed to one column for exactly this reason — a
-single chat window can't make that case.
+**Why the split screen.** The left panel proves the agent can converse —
+over WhatsApp or by voice. The ops panel proves the conversation is actually
+operational data: a ticket with an ID, a status, a customer, and a pipeline
+that moves, always visible regardless of which channel produced it. That's
+the difference between "cool chatbot demo" and "this replaces part of my
+support queue." The two panels are never collapsed to one column for exactly
+this reason — a single chat or call window can't make that case, and neither
+can two ops consoles that don't agree with each other.
 
 **Why brand config is externalised.** `src/config/brand.ts` holds identity
 (name, colors, agent name, tone, catalog, return window) for two verticals —
@@ -199,6 +245,40 @@ multi-file refactor, and needing a *second* provider on short notice
 (testing tonight, quota exhausted) is exactly the scenario this boundary
 was built for.
 
+**Why voice required zero changes to policy or the provider layer.**
+`src/lib/policy.ts` and `src/lib/llmProvider.ts` are byte-for-byte identical
+to the WhatsApp-only version of this app. Eligibility rules don't care how
+the question arrived; the streaming fetch, the SSE parsing, the tool-calling
+loop, and the model selection don't either. Adding a second channel meant
+adding a second system prompt (`src/lib/voiceSystemPrompt.ts` — banning
+markdown/emoji, requiring 1-2 sentence replies, and a rule about not
+guessing at fragmentary speech that chat doesn't need) and a second
+sanitizer (`src/lib/sanitizeSpeechText.ts`, stripping stray formatting
+before it's read aloud, versus `formatText.ts` rendering it as bold for
+chat) — new *content*, not new *plumbing*. The one real code change,
+`tools.ts`'s duplicate-booking guard, is not a voice carve-out either: it
+fixes a gap that voice testing surfaced (a call doesn't end when the
+transaction does — the customer is still on the line, and a stray "thanks,
+one more thing" can look like a second return request) but the fix applies
+identically to both channels, because there's only one `createReturnTicket`
+implementation for both to call.
+
+**Why chat and voice share one hook instead of one each.**
+`useReturnAgent.ts` holds ticket state, the ticket ID sequence, and
+`buildExecutors` exactly once, in a "shared" section both channels' send
+functions call into — see the comment at the top of the file. Each channel
+gets its own transcript, its own `ChatSession` (so its own system prompt),
+and its own typing/streaming UI state, because a WhatsApp exchange and a
+phone call are genuinely two independent conversations with the model, not
+one conversation shown two ways. But there is exactly one
+`createReturnTicket` closure, closing over the same `tickets` state and the
+same duplicate-booking guard regardless of which channel's turn called it.
+That's what makes "switch channels mid-demo, tickets persist" true
+structurally rather than by careful bookkeeping: there's only one ops
+backend for either channel to write to. The channel switcher itself
+(`channel` state in the hook, read by `App.tsx` to choose which panel to
+render) touches neither channel's conversation — it's a pure view toggle.
+
 **Why chat formatting is sanitized in code, not just prompted.** The system
 prompt asks the model to use WhatsApp's `*single-asterisk*` bold instead of
 markdown's `**double-asterisk**` (the chat bubbles render plain text, no
@@ -216,22 +296,28 @@ instruction.
 
 Vite + React + TypeScript + Tailwind CSS v4, Groq or OpenRouter's
 OpenAI-compatible REST APIs (`openai/gpt-oss-20b`, streamed via plain
-`fetch` — no SDK), no backend, no state management library — plain React
-state in `src/hooks/useReturnAgent.ts`.
+`fetch` — no SDK), the browser's native Web Speech API for the voice
+channel (no telephony/speech vendor, no SDK there either), no backend, no
+state management library — plain React state in `src/hooks/useReturnAgent.ts`.
 
 ## Project structure
 
 ```
 src/
-  config/brand.ts        # brand identity + catalog per vertical
-  data/orders.ts          # ~20 seeded Vastra (fashion) orders
-  data/pharmacyOrders.ts  # ~10 seeded WellNest (pharmacy) orders
-  data/scenarios.ts       # scripted "Play scenario" openers
-  lib/policy.ts           # deterministic eligibility rules
-  lib/tools.ts            # pure tool implementations (lookupOrder, etc.)
-  lib/llmProvider.ts      # the ONLY file that knows the LLM vendor(s); streaming Groq/OpenRouter client + function-calling loop
-  lib/systemPrompt.ts     # conversational script (not policy)
-  lib/formatText.ts       # sanitizes model output to WhatsApp formatting (code enforces, not the prompt)
-  hooks/useReturnAgent.ts # central state: chat, tickets, brand, stats, live tool activity
-  components/             # ChatPanel (left) + OpsDashboard (right)
+  config/brand.ts          # brand identity + catalog + voice settings per vertical
+  data/orders.ts           # ~20 seeded Vastra (fashion) orders
+  data/pharmacyOrders.ts   # ~10 seeded WellNest (pharmacy) orders
+  data/scenarios.ts        # scripted "Play scenario" openers, shared by both channels
+  lib/policy.ts            # deterministic eligibility rules — unchanged by adding voice
+  lib/tools.ts             # pure tool implementations, incl. the duplicate-booking guard, shared by both channels
+  lib/llmProvider.ts       # the ONLY file that knows the LLM vendor(s); streaming Groq/OpenRouter client + function-calling loop — unchanged by adding voice
+  lib/systemPrompt.ts      # WhatsApp channel's conversational script (not policy)
+  lib/voiceSystemPrompt.ts # voice channel's conversational script — different formatting/brevity rules, same flow
+  lib/formatText.ts        # chat sanitizer: renders the model's *bold* as actual bold (code enforces, not the prompt)
+  lib/sanitizeSpeechText.ts # voice sanitizer: strips stray markdown before it's read aloud
+  lib/selectVoice.ts       # ranks installed browser voices against a brand's preference list
+  hooks/useReturnAgent.ts  # central state: shared tickets/executors, per-channel chat + voice sub-state, brand, channel
+  hooks/useSpeechRecognition.ts # wraps SpeechRecognition (Chrome/Edge only)
+  hooks/useSpeechSynthesis.ts   # wraps speechSynthesis
+  components/               # ChatPanel + CallPanel (left, channel-switched) + OpsDashboard (right, always visible)
 ```

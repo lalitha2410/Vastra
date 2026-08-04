@@ -149,16 +149,53 @@ export interface CreateReturnTicketResult {
   found: boolean;
   ticket?: ReturnTicket;
   error?: string;
+  /** True when this order+item already has an open ticket — see the
+   * duplicate-booking guard below. `ticket` on this branch is the
+   * *existing* ticket, not a newly created one; the caller must not treat
+   * it as new (no re-adding to state, no re-scheduling progression). */
+  alreadyBooked?: boolean;
 }
 
+/**
+ * Deliberate duplicate-booking guard, not just a prompt instruction.
+ * Surfaced by testing the voice channel: a phone call doesn't end when the
+ * transaction does — the customer is still on the line, and anything they
+ * say next still reaches the model as a fresh turn, so a chatty "thanks,
+ * one more thing..." (or a stray "the first slot works great" left over
+ * from an earlier turn) can read to the model as a new return request for
+ * the same item and trigger a second createReturnTicket call. Chat mostly
+ * avoids this — a typed message is only ever sent once, on enter — but the
+ * guard applies to both channels since it costs nothing when unneeded and
+ * a wrong duplicate ticket is a real (if rarer) risk there too. Telling
+ * the model not to via the system prompt is necessary but not sufficient —
+ * same reasoning as checkEligibility(): a rules engine a QA engineer can
+ * unit-test beats trusting an LLM to remember a constraint across an
+ * arbitrarily long conversation. `existingTickets` is the source of truth
+ * here, not anything the model has said.
+ */
 export function createReturnTicketTool(
   catalog: Order[],
   input: CreateReturnTicketInput,
   ticketSequence: number,
+  existingTickets: ReturnTicket[],
   now: number = Date.now(),
 ): CreateReturnTicketResult {
   const match = findOrderAndItem(catalog, input.orderId, input.itemId);
   if (!match) return { found: false, error: 'Order or item not found.' };
+
+  const priorTicket = existingTickets.find(
+    (t) => t.orderId === match.order.orderId && t.itemId === match.item.itemId,
+  );
+  if (priorTicket) {
+    return {
+      found: true,
+      alreadyBooked: true,
+      ticket: priorTicket,
+      error: `This item already has an open return: ${priorTicket.ticketId} (${priorTicket.resolution}${
+        priorTicket.resolution === 'exchange' ? ` to size ${priorTicket.exchangeSize}` : ''
+      }, ${priorTicket.slot?.label ?? 'pickup scheduled'}). Do not create another ticket for it — just relay these details if the customer asks.`,
+    };
+  }
 
   const eligibility = checkEligibility(match.order, match.item, new Date(now));
   if (!eligibility.eligible) {

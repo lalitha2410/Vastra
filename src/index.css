@@ -79,3 +79,40 @@ body {
 .stream-cursor {
   animation: stream-cursor-blink 0.8s step-end infinite;
 }
+
+/* Mic button — expanding, fading ring behind the button while listening. */
+@keyframes mic-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  100% {
+    transform: scale(1.65);
+    opacity: 0;
+  }
+}
+
+.mic-pulse-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  border-width: 2px;
+  border-style: solid;
+  animation: mic-pulse 1.6s ease-out infinite;
+}
+
+/* Speaking waveform bars inside the mic button. */
+@keyframes wave-bar {
+  0%,
+  100% {
+    height: 6px;
+  }
+  50% {
+    height: 22px;
+  }
+}
+
+.wave-bar {
+  height: 6px;
+  animation: wave-bar 0.9s ease-in-out infinite;
+}

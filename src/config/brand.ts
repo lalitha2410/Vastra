@@ -10,6 +10,17 @@ export interface BrandColors {
   tint: string;
 }
 
+/** Speech-synthesis preferences for the agent's voice. `langPrefixes` and
+ * `nameHints` are tried in order against the browser's actual voice list
+ * (see hooks/useSpeechSynthesis.ts) — which voices are installed varies by
+ * OS/browser, so this is a ranked wishlist, not a guarantee. */
+export interface VoiceSettings {
+  langPrefixes: string[];
+  nameHints: string[];
+  rate: number;
+  pitch: number;
+}
+
 export interface BrandConfig {
   id: string;
   name: string;
@@ -20,8 +31,14 @@ export interface BrandConfig {
   agentName: string;
   /** Free-text tone description injected into the agent's system instruction. */
   tone: string;
+  voice: VoiceSettings;
   returnWindowDays: number;
   waNumber: string;
+  /** Displayed in the voice channel's call header — the "line" the customer
+   * is calling, as distinct from the WhatsApp number the chat channel shows.
+   * Same brand, same agent, two separate contact numbers, same as most
+   * real D2C support setups. */
+  supportNumber: string;
   catalog: Order[];
 }
 
@@ -37,10 +54,19 @@ export const vastraBrand: BrandConfig = {
   },
   agentName: 'Riya',
   tone:
-    'warm, upbeat, and conversational — like a helpful store associate texting on WhatsApp. ' +
-    'Use short, friendly sentences and the occasional emoji (max one per message). Never sound scripted or robotic.',
+    'warm, upbeat, and conversational — like a helpful store associate. ' +
+    'Use short, friendly sentences. Never sound scripted or robotic.',
+  voice: {
+    // Ranked preference: a female Indian-English voice first, then any
+    // Indian-English voice, then any English voice at all.
+    langPrefixes: ['en-IN', 'en-GB', 'en-US', 'en'],
+    nameHints: ['india', 'indian', 'veena', 'raveena', 'lekha', 'female'],
+    rate: 1.0,
+    pitch: 1.05,
+  },
   returnWindowDays: 7,
   waNumber: '+91 98450 12345',
+  supportNumber: '+91 98450 12345',
   catalog: orders,
 };
 
@@ -57,10 +83,20 @@ export const pharmacyBrand: BrandConfig = {
   agentName: 'Aarav',
   tone:
     'calm, precise, and reassuring — like a pharmacist\'s assistant. Keep language clear and unambiguous, ' +
-    'avoid casual slang and emojis, and be extra careful to state safety/regulatory reasons when a medicine ' +
+    'avoid casual slang, and be extra careful to state safety/regulatory reasons when a medicine ' +
     'return is refused (e.g. medicines cannot be returned once dispensed, except for damaged/wrong items).',
+  voice: {
+    // Ranked preference: a male Indian-English voice first, then any
+    // Indian-English voice, then any English voice at all — distinct from
+    // Riya's, matching Aarav's implied gender and calmer, measured tone.
+    langPrefixes: ['en-IN', 'en-GB', 'en-US', 'en'],
+    nameHints: ['ravi', 'prabhat', 'india', 'indian', 'male'],
+    rate: 0.95,
+    pitch: 0.95,
+  },
   returnWindowDays: 2,
   waNumber: '+91 98450 67890',
+  supportNumber: '+91 98450 67890',
   catalog: pharmacyOrders,
 };
 

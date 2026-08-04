@@ -83,3 +83,30 @@ export interface ChatMessage {
   timestamp: number;
   pending?: boolean;
 }
+
+/** Which channel a conversation is happening over — the one flag that
+ * decides system prompt, sanitizer, and left-panel UI (see App.tsx,
+ * useReturnAgent.ts). Everything else (policy, tools, provider) is
+ * identical regardless of this value. */
+export type Channel = 'whatsapp' | 'voice';
+
+/** One turn in a voice call transcript. Structurally identical to
+ * ChatMessage aside from `interim` vs `pending` — kept as a separate type
+ * because the two mean different things: `interim` marks a not-yet-final
+ * speech-recognition guess (shown dimmed, replaced in place once the
+ * browser finalizes it), never appended as a separate entry. */
+export interface TranscriptEntry {
+  id: string;
+  role: 'user' | 'agent' | 'system';
+  text: string;
+  timestamp: number;
+  interim?: boolean;
+}
+
+/** Drives the mic button's visual state and the call header's status line.
+ * - idle: waiting for the customer to speak or type
+ * - listening: SpeechRecognition is capturing audio
+ * - thinking: transcript sent, waiting on the LLM (tool calls included)
+ * - speaking: speechSynthesis is reading the agent's reply aloud
+ */
+export type CallStatus = 'idle' | 'listening' | 'thinking' | 'speaking';
