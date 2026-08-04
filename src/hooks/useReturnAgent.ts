@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { BrandConfig } from '../config/brand';
 import { getBrandById, vastraBrand } from '../config/brand';
-import type { CallStatus, Channel, ChatMessage, ReturnTicket, TicketStatus, TranscriptEntry } from '../types';
+import type { CallLogEntry, CallStatus, Channel, ChatMessage, ReturnTicket, TicketStatus, TranscriptEntry } from '../types';
 import {
   getActiveProvider,
   hasApiKey,
@@ -250,11 +250,21 @@ export function useReturnAgent() {
   const [callMessages, setCallMessages] = useState<TranscriptEntry[]>([]);
   const [callActive, setCallActive] = useState(false);
   const [callSeconds, setCallSeconds] = useState(0);
+  const [callLog, setCallLog] = useState<CallLogEntry[]>([]);
   const [isProcessingVoice, setIsProcessingVoice] = useState(false);
   const [voiceToolActivity, setVoiceToolActivity] = useState<string | null>(null);
   const [voiceStreamingText, setVoiceStreamingText] = useState('');
   const voiceSessionRef = useRef<ChatSession | null>(null);
   const callStartRef = useRef<number | null>(null);
+  // Mirrors of state an async/stable callback needs the *current* value of
+  // (same reasoning as ticketsRef above) — callMessagesRef so endCall can
+  // archive whatever was actually said, and callStartTicketIdsRef so it can
+  // tell which tickets were created *during this call* versus already there.
+  const callMessagesRef = useRef<TranscriptEntry[]>([]);
+  useEffect(() => {
+    callMessagesRef.current = callMessages;
+  }, [callMessages]);
+  const callStartTicketIdsRef = useRef<Set<string>>(new Set());
 
   const tts = useSpeechSynthesis(brand.voice);
 
@@ -278,6 +288,7 @@ export function useReturnAgent() {
 
   const startCall = useCallback(() => {
     callStartRef.current = Date.now();
+    callStartTicketIdsRef.current = new Set(ticketsRef.current.map((t) => t.ticketId));
     setCallSeconds(0);
     setCallActive(true);
     setVoiceToolActivity(null);
@@ -291,10 +302,35 @@ export function useReturnAgent() {
     tts.speak(greetingText);
   }, [apiKeyMissing, tts]);
 
+  /**
+   * Ends the call and archives it into the log — an ops console watches
+   * calls across a whole day, not one at a time, so ending a call must not
+   * discard the transcript the way starting the next one used to. Only
+   * logs calls where the customer actually said something (greeting-only
+   * calls, e.g. immediately hanging up, aren't worth a log row). Duration
+   * is computed fresh from callStartRef rather than read from the
+   * `callSeconds` state, since that only updates once a second and could
+   * be up to 1s stale at the exact moment of hangup.
+   */
   const endCall = useCallback(() => {
     tts.cancel();
+    if (callStartRef.current && callMessagesRef.current.length > 1) {
+      const durationSeconds = Math.floor((Date.now() - callStartRef.current) / 1000);
+      const newTickets = ticketsRef.current.filter((t) => !callStartTicketIdsRef.current.has(t.ticketId));
+      const outcome =
+        newTickets.length > 0
+          ? newTickets
+              .map((t) => `${t.ticketId} · ${t.resolution === 'exchange' ? `Exchange → ${t.exchangeSize}` : 'Refund'}`)
+              .join(', ')
+          : 'No return created';
+      setCallLog((prev) => [
+        { id: uid(), endedAt: Date.now(), durationSeconds, transcript: callMessagesRef.current, outcome },
+        ...prev,
+      ]);
+    }
     callStartRef.current = null;
     setCallActive(false);
+    setCallSeconds(0);
   }, [tts]);
 
   const sendVoiceMessage = useCallback(
@@ -359,6 +395,7 @@ export function useReturnAgent() {
       setCallActive(false);
       setCallSeconds(0);
       setCallMessages([]);
+      setCallLog([]);
       setVoiceToolActivity(null);
       setVoiceStreamingText('');
       setIsProcessingVoice(false);
@@ -400,6 +437,7 @@ export function useReturnAgent() {
       messages: callMessages,
       callActive,
       callSeconds,
+      callLog,
       callStatus,
       toolActivity: voiceToolActivity,
       streamingText: voiceStreamingText,

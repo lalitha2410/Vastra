@@ -68,6 +68,7 @@ export function TopBar({ brand, channel, onBrandChange, onChannelChange, onReset
             </option>
           ))}
         </select>
+        <span className="hidden text-[10px] text-[#9ca3af] md:inline">Demo session · refresh resets all data</span>
         <button
           type="button"
           onClick={onReset}

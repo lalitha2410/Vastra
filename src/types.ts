@@ -110,3 +110,16 @@ export interface TranscriptEntry {
  * - speaking: speechSynthesis is reading the agent's reply aloud
  */
 export type CallStatus = 'idle' | 'listening' | 'thinking' | 'speaking';
+
+/** A completed call, archived when the customer hangs up. An ops team
+ * watches calls across an entire day, not one at a time — so ending a call
+ * logs it instead of discarding the transcript (see useReturnAgent.ts's
+ * endCall). `outcome` is derived from whichever tickets were created
+ * between call start and call end, not from anything the model said. */
+export interface CallLogEntry {
+  id: string;
+  endedAt: number;
+  durationSeconds: number;
+  transcript: TranscriptEntry[];
+  outcome: string;
+}
