@@ -146,6 +146,36 @@ export function getActiveProvider(): ProviderDisplayInfo {
   return PROVIDER_DISPLAY[PROVIDER_ORDER[0]];
 }
 
+/**
+ * Logs which providers are usable exactly once, at module load (so it's
+ * always the first thing a fresh console shows, before any request is
+ * made) — added specifically to debug "fallback isn't triggering in
+ * production" reports, where the actual cause is almost always an env var
+ * that never made it into the deploy's build environment (Vite inlines
+ * `VITE_*` vars at *build* time — see README "Deploying to Vercel" — so a
+ * key added to `.env` locally or to a Vercel project *after* the last
+ * build simply isn't in the bundle, with no error to point at it). Never
+ * logs a key's value, only whether one was found, so this is safe to
+ * leave on in a public demo's console.
+ */
+function logProviderConfigAtStartup(): void {
+  const lines = PROVIDER_ORDER.map((name) => {
+    const spec = buildProviderSpec(name);
+    const envVarName = PROVIDER_DISPLAY[name].envVarName;
+    const found = Boolean(spec.apiKey && spec.apiKey.trim().length > 0);
+    return `  ${found ? '✓' : '✗'} ${name} (${envVarName}): ${found ? 'configured' : 'MISSING — this provider will be skipped'}`;
+  });
+  const configured = getConfiguredProviders();
+  console.log(
+    `[llmProvider] startup provider check —\n${lines.join('\n')}\nFallback order for this session: ${
+      configured.length > 0
+        ? configured.map((p) => p.name).join(' -> ')
+        : '(none — hasApiKey() is false, ApiKeyNotice will show)'
+    }`,
+  );
+}
+logProviderConfigAtStartup();
+
 // --- OpenAI-style tool declarations (all three providers' chat completions
 // APIs are OpenAI-compatible, so tools are described the same way
 // regardless of which one answers). ---

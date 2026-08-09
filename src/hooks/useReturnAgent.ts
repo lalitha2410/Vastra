@@ -133,6 +133,29 @@ interface ConversationFacts {
 function updateFacts(facts: ConversationFacts, name: string, args: Record<string, unknown>, result: unknown): void {
   const r = result as Record<string, unknown> | undefined;
   switch (name) {
+    case 'lookupOrder': {
+      // Captured here, not just from checkReturnEligibility below: the
+      // model often asks the customer to confirm which item before ever
+      // calling checkReturnEligibility (especially on a single-item
+      // order, where confirmation is really just a courtesy check), so
+      // waiting for eligibility to populate orderId/itemId left a gap —
+      // exactly one tool call wide, but enough for a low-reasoning-effort
+      // model to lose the order between "here's your order, confirm?" and
+      // the customer's "yes". Only set itemId/itemName here when there's
+      // exactly one order and one item — i.e. genuinely unambiguous;
+      // multi-item or multi-order (phone lookup) cases stay unresolved
+      // until checkReturnEligibility/getAvailableSizes pins down which
+      // item, same as before.
+      const orders = r?.orders as { orderId: string; items: { itemId: string; name: string }[] }[] | undefined;
+      if (orders?.length === 1) {
+        facts.orderId = orders[0].orderId;
+        if (orders[0].items.length === 1) {
+          facts.itemId = orders[0].items[0].itemId;
+          facts.itemName = orders[0].items[0].name;
+        }
+      }
+      break;
+    }
     case 'checkReturnEligibility':
       if (r?.found) {
         facts.orderId = String(args.orderId ?? facts.orderId ?? '');
@@ -140,7 +163,15 @@ function updateFacts(facts: ConversationFacts, name: string, args: Record<string
         facts.itemName = r.itemName as string | undefined;
         facts.eligible = r.eligible as boolean | undefined;
         facts.ineligibleReason = r.eligible ? undefined : ((r.reasons as string[] | undefined) ?? []).join(' ');
-        facts.awaitingReason = r.eligible === true;
+        // Only arm reason-capture if we don't already have one. This tool
+        // gets called more than once in practice (the model re-verifying
+        // eligibility before finalizing, seen in live testing) — without
+        // this guard, a redundant later call re-opens the capture window,
+        // and captureReasonIfAwaited then treats the customer's NEXT
+        // message — which could be a pickup slot choice, not a reason at
+        // all — as a fresh reason, overwriting the correct one already
+        // captured with garbage.
+        if (r.eligible === true && !facts.reason) facts.awaitingReason = true;
       }
       break;
     case 'getAvailableSizes':
@@ -155,6 +186,12 @@ function updateFacts(facts: ConversationFacts, name: string, args: Record<string
       if (r?.success && r.ticket) {
         const t = r.ticket as ReturnTicket;
         facts.ticketId = t.ticketId;
+        // Overwrites whatever captureReasonIfAwaited guessed earlier with
+        // the model's own validated enum value — authoritative by
+        // construction (it's what actually got booked), so it corrects a
+        // bad positional guess instead of leaving it to linger in the
+        // summary for the rest of the conversation.
+        facts.reason = t.reason;
         facts.resolution = t.resolution;
         facts.exchangeSize = t.exchangeSize;
         facts.pickupLabel = t.slot?.label;
@@ -164,13 +201,30 @@ function updateFacts(facts: ConversationFacts, name: string, args: Record<string
   }
 }
 
-/** The customer's next message after eligibility resolves eligible is
- * their answer to "why do you want to return it" — see ConversationFacts'
- * doc comment. Called right before building this turn's context summary,
- * so a reason stated in the PREVIOUS turn is captured before it can fall
- * out of the recent-message window in some future turn. */
+// Bare acknowledgements aren't a reason — seen in practice when the model's
+// own reply resolves eligibility AND asks for the reason in the same
+// breath (nothing to confirm separately), so the customer's next message
+// can be a stray "yes"/"ok" answering something else entirely, not the
+// reason question at all. Capturing that verbatim as `reason` corrupts the
+// summary for the rest of the conversation (the model sees a nonsense
+// "stated reason: yes" and gets confused later, even after the real reason
+// is given and acted on). This is a narrow validity check, not an attempt
+// to classify what the reason actually IS — that stays entirely the
+// model's job; a filler word is rejected regardless of what the true
+// reason later turns out to be.
+const BARE_ACKNOWLEDGEMENTS = new Set(['yes', 'yeah', 'yep', 'yup', 'sure', 'ok', 'okay', 'y', 'no', 'nope', 'n']);
+
+/** The customer's next SUBSTANTIVE message after eligibility resolves
+ * eligible is their answer to "why do you want to return it" — see
+ * ConversationFacts' doc comment. Called right before building this turn's
+ * context summary, so a reason stated in the PREVIOUS turn is captured
+ * before it can fall out of the recent-message window in some future
+ * turn. Leaves `awaitingReason` set on a bare acknowledgement so the next
+ * real answer still gets captured (see BARE_ACKNOWLEDGEMENTS above) —
+ * `createReturnTicket`'s handler in updateFacts is the final backstop if
+ * this still ends up wrong. */
 function captureReasonIfAwaited(facts: ConversationFacts, incomingMessage: string): void {
-  if (facts.awaitingReason) {
+  if (facts.awaitingReason && !BARE_ACKNOWLEDGEMENTS.has(incomingMessage.trim().toLowerCase())) {
     facts.reason = incomingMessage;
     facts.awaitingReason = false;
   }
