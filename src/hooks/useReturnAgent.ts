@@ -101,33 +101,75 @@ function isQuotaError(raw: string): boolean {
  * unless it's captured here first. This is the domain-specific half of
  * that trade: llmProvider.ts stays vendor-only and has no idea what
  * "order ID" or "reason" mean, so the facts worth remembering, and how to
- * extract them, live here instead, built entirely from structured tool
- * calls/results — never by re-reading or guessing from prose — same
- * "tools decide, code enforces" principle as the policy engine.
+ * extract them, live here instead.
  *
- * `reason` is the one fact no tool ever receives before createReturnTicket
- * is finally called (none of the earlier tools take it as an argument),
- * so it can't be read off a tool result the way everything else here can.
- * Instead it's captured positionally: the system prompt's own step 3
- * always asks for it immediately after step 2's eligibility check
- * resolves, so the customer's next message once `awaitingReason` is set
- * is captured verbatim as the reason. Deterministic and tied to a
- * structured event (a tool call resolving), not pattern-matching on text.
+ * Every fact the conversation can establish, and where it comes from:
+ *   - orderId, itemId, itemName, paymentMethod  <- lookupOrder (once
+ *     unambiguous) and/or checkReturnEligibility
+ *   - eligible, ineligibleReason                <- checkReturnEligibility
+ *   - reason                                    <- see PENDING CAPTURE below
+ *   - availableSizes                            <- getAvailableSizes
+ *   - resolution, exchangeSize                  <- see PENDING CAPTURE below
+ *   - pickupSlots (offered), pickupLabel (chosen) <- getPickupSlots /
+ *     see PENDING CAPTURE below
+ *   - ticketId                                  <- createReturnTicket
+ *
+ * PENDING CAPTURE: `reason`, `exchangeSize`, and the chosen pickup slot are
+ * the facts no tool receives as an argument until createReturnTicket is
+ * finally called — none of the earlier tools take them, so they can't be
+ * read off a tool result the way everything else here can. Each is instead
+ * captured positionally via `pendingCapture`: the system prompt's own flow
+ * always asks for exactly one of these immediately after the tool call
+ * that makes the question obvious (eligibility resolving -> ask reason;
+ * sizes fetched -> ask which size; slots fetched -> ask which slot), so
+ * the customer's next message is captured as the answer to whichever
+ * question is currently pending. Tied to a structured event (a tool call
+ * resolving), not pattern-matching on text content — see
+ * captureNextReply's own comment for the one narrow exception (mapping a
+ * bare "2" back to the numbered list the model itself presented).
+ * `createReturnTicket`'s handler below is the final backstop for all
+ * three: whatever actually got booked overwrites whatever was guessed.
  */
 interface ConversationFacts {
   orderId?: string;
   itemId?: string;
   itemName?: string;
+  paymentMethod?: string;
   eligible?: boolean;
   ineligibleReason?: string;
-  awaitingReason?: boolean;
   reason?: string;
   availableSizes?: string[];
-  pickupSlots?: { slotId: string; label: string }[];
-  ticketId?: string;
   resolution?: string;
   exchangeSize?: string;
+  pickupSlots?: { slotId: string; label: string }[];
   pickupLabel?: string;
+  ticketId?: string;
+  /** What the customer's NEXT message should be interpreted as, if
+   * nothing else claims it first. Armed by whichever tool call just made
+   * the follow-up question obvious; consumed (and cleared) by
+   * captureNextReply. At most one fact is ever "pending" at a time —
+   * later tool calls in the same turn simply overwrite an earlier one,
+   * which matches the flow: the model doesn't ask two different
+   * open questions in a row. */
+  pendingCapture?: 'reason' | 'exchangeSize' | 'slot';
+}
+
+// The exact digit order step 3 of the system prompt declares ("map their
+// answer to: size, quality, not_as_described, changed_mind") — kept in
+// sync with that wording by hand, not derived from it, since the prompt
+// is prose for the model and this is a strict lookup table for us. Used
+// ONLY to resolve a bare numeral reply ("2") back to what it actually
+// means; a prose reply is still captured verbatim, unchanged.
+const REASON_BY_DIGIT: Record<string, string> = {
+  '1': 'size',
+  '2': 'quality',
+  '3': 'not_as_described',
+  '4': 'changed_mind',
+};
+
+function leadingDigit(text: string): string | null {
+  const m = text.trim().match(/^([1-9])\b/);
+  return m ? m[1] : null;
 }
 
 function updateFacts(facts: ConversationFacts, name: string, args: Record<string, unknown>, result: unknown): void {
@@ -146,9 +188,12 @@ function updateFacts(facts: ConversationFacts, name: string, args: Record<string
       // multi-item or multi-order (phone lookup) cases stay unresolved
       // until checkReturnEligibility/getAvailableSizes pins down which
       // item, same as before.
-      const orders = r?.orders as { orderId: string; items: { itemId: string; name: string }[] }[] | undefined;
+      const orders = r?.orders as
+        | { orderId: string; paymentMethod: string; items: { itemId: string; name: string }[] }[]
+        | undefined;
       if (orders?.length === 1) {
         facts.orderId = orders[0].orderId;
+        facts.paymentMethod = orders[0].paymentMethod;
         if (orders[0].items.length === 1) {
           facts.itemId = orders[0].items[0].itemId;
           facts.itemName = orders[0].items[0].name;
@@ -166,81 +211,128 @@ function updateFacts(facts: ConversationFacts, name: string, args: Record<string
         // Only arm reason-capture if we don't already have one. This tool
         // gets called more than once in practice (the model re-verifying
         // eligibility before finalizing, seen in live testing) — without
-        // this guard, a redundant later call re-opens the capture window,
-        // and captureReasonIfAwaited then treats the customer's NEXT
-        // message — which could be a pickup slot choice, not a reason at
-        // all — as a fresh reason, overwriting the correct one already
-        // captured with garbage.
-        if (r.eligible === true && !facts.reason) facts.awaitingReason = true;
+        // this guard, a redundant later call re-opens the capture window
+        // and treats the customer's NEXT message — which could be a
+        // pickup slot choice, not a reason at all — as a fresh reason,
+        // overwriting the correct one already captured with garbage.
+        if (r.eligible === true && !facts.reason) facts.pendingCapture = 'reason';
       }
       break;
     case 'getAvailableSizes':
-      if (r?.found) facts.availableSizes = r.availableSizes as string[] | undefined;
+      if (r?.found) {
+        facts.availableSizes = r.availableSizes as string[] | undefined;
+        // Only called (per the system prompt) when reason is "size" and
+        // exchange is being offered — so the customer's next message is
+        // their size choice, unless resolution is already settled (e.g.
+        // this is a redundant re-check after the ticket's already booked).
+        if (!facts.ticketId) facts.pendingCapture = 'exchangeSize';
+      }
       break;
     case 'getPickupSlots':
       if (Array.isArray(result)) {
         facts.pickupSlots = result.map((s) => ({ slotId: s.slotId, label: s.label }));
+        if (!facts.ticketId) facts.pendingCapture = 'slot';
       }
       break;
     case 'createReturnTicket':
       if (r?.success && r.ticket) {
         const t = r.ticket as ReturnTicket;
         facts.ticketId = t.ticketId;
-        // Overwrites whatever captureReasonIfAwaited guessed earlier with
-        // the model's own validated enum value — authoritative by
-        // construction (it's what actually got booked), so it corrects a
-        // bad positional guess instead of leaving it to linger in the
-        // summary for the rest of the conversation.
+        // Overwrites whatever pending-capture guessed earlier with the
+        // model's own validated values — authoritative by construction
+        // (it's what actually got booked), so it corrects a bad
+        // positional guess instead of leaving it to linger in the summary
+        // for the rest of the conversation.
         facts.reason = t.reason;
         facts.resolution = t.resolution;
         facts.exchangeSize = t.exchangeSize;
         facts.pickupLabel = t.slot?.label;
-        facts.awaitingReason = false;
+        facts.pendingCapture = undefined;
       }
       break;
   }
 }
 
-// Bare acknowledgements aren't a reason — seen in practice when the model's
-// own reply resolves eligibility AND asks for the reason in the same
-// breath (nothing to confirm separately), so the customer's next message
-// can be a stray "yes"/"ok" answering something else entirely, not the
-// reason question at all. Capturing that verbatim as `reason` corrupts the
-// summary for the rest of the conversation (the model sees a nonsense
-// "stated reason: yes" and gets confused later, even after the real reason
-// is given and acted on). This is a narrow validity check, not an attempt
-// to classify what the reason actually IS — that stays entirely the
-// model's job; a filler word is rejected regardless of what the true
-// reason later turns out to be.
+// Bare acknowledgements never answer an open question like "why do you
+// want to return it", "which size", or "which slot" — seen in practice
+// when the model resolves a step AND asks the next open question in the
+// same breath (nothing to separately confirm), so the customer's next
+// message can be a stray "yes"/"ok" answering something else entirely.
+// Capturing that verbatim corrupts the summary for the rest of the
+// conversation (the model sees a nonsense "stated reason: yes" and gets
+// confused later, even after the real answer is given and acted on).
+// This is a narrow validity check, not an attempt to classify what the
+// answer actually IS — that stays entirely the model's job; a filler word
+// is rejected regardless of what the true answer later turns out to be.
 const BARE_ACKNOWLEDGEMENTS = new Set(['yes', 'yeah', 'yep', 'yup', 'sure', 'ok', 'okay', 'y', 'no', 'nope', 'n']);
 
-/** The customer's next SUBSTANTIVE message after eligibility resolves
- * eligible is their answer to "why do you want to return it" — see
- * ConversationFacts' doc comment. Called right before building this turn's
- * context summary, so a reason stated in the PREVIOUS turn is captured
- * before it can fall out of the recent-message window in some future
- * turn. Leaves `awaitingReason` set on a bare acknowledgement so the next
- * real answer still gets captured (see BARE_ACKNOWLEDGEMENTS above) —
- * `createReturnTicket`'s handler in updateFacts is the final backstop if
- * this still ends up wrong. */
-function captureReasonIfAwaited(facts: ConversationFacts, incomingMessage: string): void {
-  if (facts.awaitingReason && !BARE_ACKNOWLEDGEMENTS.has(incomingMessage.trim().toLowerCase())) {
-    facts.reason = incomingMessage;
-    facts.awaitingReason = false;
+/**
+ * Captures the customer's next message as the answer to whichever
+ * question is currently pending (see ConversationFacts.pendingCapture),
+ * called right before building this turn's context summary so an answer
+ * given in the PREVIOUS turn is captured before it can fall out of the
+ * recent-message window in some future turn.
+ *
+ * The one place this maps rather than stores verbatim: a bare numeral
+ * reply to the reason question ("2") is meaningless on its own once it's
+ * pulled out of the numbered list it was answering — the raw text "2" in
+ * the summary reads to the model as a fact, not a list index, and was
+ * observed live confusing it into re-asking the same question. Resolved
+ * against REASON_BY_DIGIT, which mirrors the system prompt's own fixed
+ * numbering — not a guess about intent, just decoding our own list.
+ * Pickup-slot numerals are resolved the same way, against whatever slots
+ * were actually offered this conversation (`facts.pickupSlots`) rather
+ * than a hardcoded table, since slot order is generated, not fixed prompt
+ * text. Everything else (item size, prose reasons) is stored as-is.
+ *
+ * Leaves `pendingCapture` set on a bare acknowledgement so the next real
+ * answer still gets captured — `createReturnTicket`'s handler in
+ * updateFacts is the final backstop if this still ends up wrong.
+ */
+function captureNextReply(facts: ConversationFacts, incomingMessage: string): void {
+  if (!facts.pendingCapture) return;
+  const trimmed = incomingMessage.trim();
+  if (BARE_ACKNOWLEDGEMENTS.has(trimmed.toLowerCase())) return;
+
+  if (facts.pendingCapture === 'reason') {
+    const digit = leadingDigit(trimmed);
+    facts.reason = (digit && REASON_BY_DIGIT[digit]) || trimmed;
+    // Deterministic business rule (see systemPrompt.ts step 4), not a
+    // guess about customer intent: only "size" ever goes through the
+    // exchange path, so any other reason means the resolution is already
+    // known right now, well before getAvailableSizes/getPickupSlots run.
+    if (facts.reason !== 'size') facts.resolution = 'refund';
+    facts.pendingCapture = undefined;
+    return;
   }
+  if (facts.pendingCapture === 'exchangeSize') {
+    facts.exchangeSize = trimmed;
+    facts.resolution = 'exchange';
+    facts.pendingCapture = undefined;
+    return;
+  }
+  // 'slot'
+  const digit = leadingDigit(trimmed);
+  const bySlots = facts.pickupSlots;
+  const matched = digit && bySlots ? bySlots[Number(digit) - 1] : undefined;
+  facts.pickupLabel = matched ? matched.label : trimmed;
+  facts.pendingCapture = undefined;
 }
 
 function factsToSummary(f: ConversationFacts): string {
   const parts: string[] = [];
   if (f.orderId) parts.push(`order ${f.orderId}`);
   if (f.itemName) parts.push(`item "${f.itemName}"${f.itemId ? ` (${f.itemId})` : ''}`);
+  if (f.paymentMethod) parts.push(`payment method: ${f.paymentMethod}`);
   if (f.eligible === true) parts.push('confirmed eligible for return/exchange');
   if (f.eligible === false) parts.push(`confirmed NOT eligible (${f.ineligibleReason || 'see policy'}) — do not proceed further`);
-  if (f.reason) parts.push(`customer's stated reason: "${f.reason}"`);
+  if (f.reason) parts.push(`customer's stated reason: "${f.reason}" — do not ask for the reason again`);
   if (f.availableSizes?.length) parts.push(`sizes in stock: ${f.availableSizes.join(', ')}`);
+  if (f.resolution) parts.push(`resolution: ${f.resolution}${f.exchangeSize ? ` → size ${f.exchangeSize}` : ''}`);
   if (f.pickupSlots?.length) {
     parts.push(`pickup slots offered: ${f.pickupSlots.map((s) => `${s.slotId}=${s.label}`).join('; ')}`);
   }
+  if (f.pickupLabel) parts.push(`pickup slot chosen: ${f.pickupLabel} — do not ask for a slot again`);
   if (f.ticketId) {
     parts.push(
       `ticket ${f.ticketId} already created (${f.resolution}${f.exchangeSize ? ` → ${f.exchangeSize}` : ''}${
@@ -373,7 +465,7 @@ export function useReturnAgent() {
       setChatIsTyping(true);
       setChatToolActivity(CHAT_THINKING_LABEL);
       setChatStreamingText('');
-      captureReasonIfAwaited(chatFactsRef.current, trimmed);
+      captureNextReply(chatFactsRef.current, trimmed);
       try {
         const executors = buildExecutors(brandRef.current);
         const reply = await sendAgentMessage(
@@ -400,6 +492,8 @@ export function useReturnAgent() {
         setChatIsTyping(false);
         setChatToolActivity(null);
         setChatStreamingText('');
+        // eslint-disable-next-line no-console
+        console.log('[useReturnAgent] facts (chat) after this turn:', JSON.stringify(chatFactsRef.current));
       }
     },
     [apiKeyMissing, buildExecutors],
@@ -506,7 +600,7 @@ export function useReturnAgent() {
       setIsProcessingVoice(true);
       setVoiceToolActivity(VOICE_THINKING_LABEL);
       setVoiceStreamingText('');
-      captureReasonIfAwaited(voiceFactsRef.current, trimmed);
+      captureNextReply(voiceFactsRef.current, trimmed);
       try {
         const executors = buildExecutors(brandRef.current);
         const reply = await sendAgentMessage(
@@ -535,6 +629,8 @@ export function useReturnAgent() {
         setIsProcessingVoice(false);
         setVoiceToolActivity(null);
         setVoiceStreamingText('');
+        // eslint-disable-next-line no-console
+        console.log('[useReturnAgent] facts (voice) after this turn:', JSON.stringify(voiceFactsRef.current));
       }
     },
     [apiKeyMissing, buildExecutors, callActive, speakAgentLine],
