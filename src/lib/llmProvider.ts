@@ -284,6 +284,21 @@ const toolDeclarations: ToolDeclaration[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'sendBankDetailsLink',
+      description:
+        "Send a secure link for the customer to enter their bank details, for a COD refund ONLY (never for Prepaid or for an exchange — those need no bank details and this tool will refuse). Call this BEFORE ever telling the customer a link has been sent — never claim a link was sent without calling this first. Safe to call again if asked 'where is the link' later; it will not send a duplicate.",
+      parameters: {
+        type: 'object',
+        properties: {
+          ticketId: { type: 'string', description: 'The return ticket ID just created, e.g. "RET-1001".' },
+        },
+        required: ['ticketId'],
+      },
+    },
+  },
 ];
 
 export type ToolExecutor = (args: Record<string, unknown>) => unknown;

@@ -1,11 +1,11 @@
-import { TICKET_STATUS_ORDER, type TicketStatus } from '../types';
+import type { TicketStatus } from '../types';
 
-export function StatusPipeline({ status, accent }: { status: TicketStatus; accent: string }) {
-  const currentIdx = TICKET_STATUS_ORDER.indexOf(status);
+export function StatusPipeline({ status, sequence, accent }: { status: TicketStatus; sequence: TicketStatus[]; accent: string }) {
+  const currentIdx = sequence.indexOf(status);
 
   return (
     <div className="flex items-center">
-      {TICKET_STATUS_ORDER.map((step, idx) => {
+      {sequence.map((step, idx) => {
         const done = idx < currentIdx;
         const active = idx === currentIdx;
         const reached = idx <= currentIdx;
@@ -30,7 +30,7 @@ export function StatusPipeline({ status, accent }: { status: TicketStatus; accen
                 {step}
               </span>
             </div>
-            {idx < TICKET_STATUS_ORDER.length - 1 && (
+            {idx < sequence.length - 1 && (
               <div
                 className="mx-0.5 mb-4 h-0.5 flex-1 transition-colors duration-700"
                 style={{ backgroundColor: idx < currentIdx ? accent : '#e5e7eb' }}
@@ -45,14 +45,27 @@ export function StatusPipeline({ status, accent }: { status: TicketStatus; accen
 
 /** Dense variant for a table row: dots + connecting line only, no per-step
  * labels (a labeled dot per step doesn't fit a table row), plus a single
- * caption for the current step so the row still states its status in words. */
-export function StatusPipelineCompact({ status, accent }: { status: TicketStatus; accent: string }) {
-  const currentIdx = TICKET_STATUS_ORDER.indexOf(status);
+ * caption for the current step so the row still states its status in words.
+ * `sequence` is per-ticket (see statusSequenceFor in types.ts), not a fixed
+ * global order — a COD refund and a Prepaid refund reach different final
+ * steps, so the caller computes the right 5-step sequence for its ticket
+ * and hands it down rather than this component assuming one universal
+ * pipeline applies to every ticket. */
+export function StatusPipelineCompact({
+  status,
+  sequence,
+  accent,
+}: {
+  status: TicketStatus;
+  sequence: TicketStatus[];
+  accent: string;
+}) {
+  const currentIdx = sequence.indexOf(status);
 
   return (
     <div className="flex items-center gap-1.5">
       <div className="flex items-center">
-        {TICKET_STATUS_ORDER.map((step, idx) => {
+        {sequence.map((step, idx) => {
           const reached = idx <= currentIdx;
           return (
             <div key={step} className="flex items-center">
@@ -60,7 +73,7 @@ export function StatusPipelineCompact({ status, accent }: { status: TicketStatus
                 className="h-1.75 w-1.75 rounded-full transition-colors duration-500"
                 style={{ backgroundColor: reached ? accent : '#e0e2e6' }}
               />
-              {idx < TICKET_STATUS_ORDER.length - 1 && (
+              {idx < sequence.length - 1 && (
                 <div
                   className="h-0.5 w-2.5 transition-colors duration-700"
                   style={{ backgroundColor: idx < currentIdx ? accent : '#e0e2e6' }}

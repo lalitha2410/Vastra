@@ -1,5 +1,5 @@
 import type { ReturnTicket } from '../types';
-import { RETURN_REASON_LABELS } from '../types';
+import { RETURN_REASON_LABELS, statusSequenceFor } from '../types';
 import { StatusPipelineCompact } from './StatusPipeline';
 
 const rupee = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
@@ -24,6 +24,11 @@ export function TicketTableHeader() {
 
 export function TicketCard({ ticket, accent }: { ticket: ReturnTicket; accent: string }) {
   const isExchange = ticket.resolution === 'exchange';
+  // COD refund is the one case where a real customer action (handing over
+  // bank details) still has to happen before the money moves — shown here
+  // so the ops console visibly reflects whether sendBankDetailsLink has
+  // actually run, not just whatever the agent claims in the transcript.
+  const showBankLinkStatus = !isExchange && ticket.paymentMethod === 'COD';
 
   return (
     <div
@@ -54,13 +59,18 @@ export function TicketCard({ ticket, accent }: { ticket: ReturnTicket; accent: s
         {isExchange ? `Exchange → ${ticket.exchangeSize}` : 'Refund'}
       </span>
 
-      <StatusPipelineCompact status={ticket.status} accent={accent} />
+      <StatusPipelineCompact status={ticket.status} sequence={statusSequenceFor(ticket)} accent={accent} />
 
       <div className="text-right">
         <p className="truncate text-[11.5px] text-[#4b5563]">{ticket.slot?.label ?? '—'}</p>
         <p className="truncate text-[12px] font-medium text-[#111827]">
           {isExchange ? 'No refund' : rupee.format(ticket.refundAmount)}
         </p>
+        {showBankLinkStatus && (
+          <p className="truncate text-[10.5px]" style={{ color: ticket.bankDetailsLinkSentAt ? accent : '#b45309' }}>
+            {ticket.bankDetailsLinkSentAt ? '✓ Bank link sent' : '⏳ Bank link pending'}
+          </p>
+        )}
       </div>
     </div>
   );

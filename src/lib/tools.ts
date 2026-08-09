@@ -234,3 +234,75 @@ export function createReturnTicketTool(
 
   return { found: true, ticket };
 }
+
+// ---------------------------------------------------------------------
+// sendBankDetailsLink
+// ---------------------------------------------------------------------
+
+export interface SendBankDetailsLinkResult {
+  found: boolean;
+  error?: string;
+  alreadySent?: boolean;
+  linkUrl?: string;
+  sentToPhone?: string;
+}
+
+/**
+ * The system prompt tells the model to say it'll send a COD customer a
+ * secure link for bank details, but "say" is exactly the gap that let it
+ * hallucinate having sent one when a customer asked "where is the link?" —
+ * there was no tool backing the claim, so nothing stopped the model from
+ * just asserting it. This is that tool: a real (mocked — no actual SMS
+ * provider behind it, same "real tool, fake backend" pattern as every
+ * other tool here) action the model must call before it's allowed to
+ * claim a link was sent, with its own guardrails so it can't be called
+ * somewhere it doesn't make sense:
+ *  - refuses if the ticket isn't COD (Prepaid never needs bank details)
+ *  - refuses if the resolution is exchange (no money moves either way)
+ *  - idempotent on a second call — returns the same link/timestamp
+ *    instead of pretending to send a fresh one, mirroring the duplicate-
+ *    booking guard on createReturnTicket
+ */
+export function sendBankDetailsLinkTool(
+  tickets: ReturnTicket[],
+  ticketId: string,
+  now: number = Date.now(),
+): { result: SendBankDetailsLinkResult; ticket: ReturnTicket | null } {
+  const ticket = tickets.find((t) => t.ticketId === ticketId);
+  if (!ticket) return { result: { found: false, error: 'No ticket with that ID.' }, ticket: null };
+
+  if (ticket.paymentMethod !== 'COD') {
+    return {
+      result: { found: false, error: `${ticket.ticketId} is ${ticket.paymentMethod}, not COD — no bank details link is needed.` },
+      ticket: null,
+    };
+  }
+  if (ticket.resolution !== 'refund') {
+    return {
+      result: { found: false, error: `${ticket.ticketId} is an exchange, not a refund — no bank details link is needed.` },
+      ticket: null,
+    };
+  }
+
+  if (ticket.bankDetailsLinkSentAt) {
+    return {
+      result: {
+        found: true,
+        alreadySent: true,
+        linkUrl: `https://vastra.example/bank-details/${ticket.ticketId}`,
+        sentToPhone: 'the customer\'s registered number',
+      },
+      ticket: null,
+    };
+  }
+
+  const updated: ReturnTicket = { ...ticket, bankDetailsLinkSentAt: now };
+  return {
+    result: {
+      found: true,
+      linkUrl: `https://vastra.example/bank-details/${ticket.ticketId}`,
+      sentToPhone: "the customer's registered number",
+    },
+    ticket: updated,
+  };
+}

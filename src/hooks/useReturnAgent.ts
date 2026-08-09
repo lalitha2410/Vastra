@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { BrandConfig } from '../config/brand';
 import { getBrandById, vastraBrand } from '../config/brand';
-import type { CallLogEntry, CallStatus, Channel, ChatMessage, ReturnTicket, TicketStatus, TranscriptEntry } from '../types';
+import {
+  statusSequenceFor,
+  type CallLogEntry,
+  type CallStatus,
+  type Channel,
+  type ChatMessage,
+  type ReturnTicket,
+  type TicketStatus,
+  type TranscriptEntry,
+} from '../types';
 import {
   getActiveProvider,
   hasApiKey,
@@ -15,6 +24,7 @@ import {
   getPickupSlotsTool,
   lookupOrder,
   checkReturnEligibilityTool,
+  sendBankDetailsLinkTool,
   type CreateReturnTicketInput,
 } from '../lib/tools';
 import { buildSystemInstruction } from '../lib/systemPrompt';
@@ -54,6 +64,7 @@ const TOOL_ACTIVITY_LABELS: Record<string, string> = {
   getAvailableSizes: 'Fetching available sizes…',
   getPickupSlots: 'Fetching pickup slots…',
   createReturnTicket: 'Creating return ticket…',
+  sendBankDetailsLink: 'Sending bank details link…',
 };
 
 const CHAT_THINKING_LABEL = 'Reading customer message…';
@@ -76,12 +87,17 @@ function newSession(systemInstruction: string): ChatSession {
 
 // Compressed, demo-friendly timeline so the ops dashboard visibly finishes
 // its pipeline during a live call instead of sitting at "Pickup Scheduled".
-const PROGRESSION: { status: TicketStatus; delayMs: number }[] = [
-  { status: 'Approved', delayMs: 1200 },
-  { status: 'Pickup Scheduled', delayMs: 2600 },
-  { status: 'In Transit', delayMs: 7000 },
-  { status: 'Refunded', delayMs: 12000 },
-];
+// The four delays are fixed regardless of ticket type — only the final
+// status label changes (see statusSequenceFor in types.ts), so a COD
+// refund's pipeline correctly stops at "Awaiting Bank Details" instead of
+// auto-completing to "Refunded", a transaction that hasn't actually
+// happened in this demo (no bank details are ever collected).
+const PROGRESSION_DELAYS_MS = [1200, 2600, 7000, 12000];
+
+function progressionFor(ticket: Pick<ReturnTicket, 'resolution' | 'paymentMethod'>): { status: TicketStatus; delayMs: number }[] {
+  const [, ...steps] = statusSequenceFor(ticket); // drop 'Initiated' — that's the status at creation, not a scheduled step
+  return steps.map((status, i) => ({ status, delayMs: PROGRESSION_DELAYS_MS[i] }));
+}
 
 export interface Stats {
   returnsToday: number;
@@ -144,6 +160,11 @@ interface ConversationFacts {
   pickupSlots?: { slotId: string; label: string }[];
   pickupLabel?: string;
   ticketId?: string;
+  /** Only true once sendBankDetailsLink actually ran (see tools.ts) —
+   * this is what lets the summary tell the model "already sent, don't
+   * send or claim to send again" instead of the model being the only
+   * record of whether that happened. */
+  bankDetailsLinkSent?: boolean;
   /** What the customer's NEXT message should be interpreted as, if
    * nothing else claims it first. Armed by whichever tool call just made
    * the follow-up question obvious; consumed (and cleared) by
@@ -250,6 +271,9 @@ function updateFacts(facts: ConversationFacts, name: string, args: Record<string
         facts.pendingCapture = undefined;
       }
       break;
+    case 'sendBankDetailsLink':
+      if (r?.found) facts.bankDetailsLinkSent = true;
+      break;
   }
 }
 
@@ -339,6 +363,13 @@ function factsToSummary(f: ConversationFacts): string {
         f.pickupLabel ? `, ${f.pickupLabel}` : ''
       }) — do NOT create another`,
     );
+    if (f.paymentMethod === 'COD' && f.resolution === 'refund') {
+      parts.push(
+        f.bankDetailsLinkSent
+          ? 'bank details link already sent for this ticket via sendBankDetailsLink — do NOT send another, and do NOT say you are sending one again if asked; just confirm it was sent'
+          : 'bank details link NOT yet sent — call sendBankDetailsLink before ever telling the customer a link was sent',
+      );
+    }
   }
   return parts.join('. ');
 }
@@ -371,9 +402,9 @@ export function useReturnAgent() {
   }, []);
 
   const scheduleProgression = useCallback(
-    (ticketId: string) => {
-      for (const step of PROGRESSION) {
-        const handle = setTimeout(() => updateTicketStatus(ticketId, step.status), step.delayMs);
+    (ticket: Pick<ReturnTicket, 'ticketId' | 'resolution' | 'paymentMethod'>) => {
+      for (const step of progressionFor(ticket)) {
+        const handle = setTimeout(() => updateTicketStatus(ticket.ticketId, step.status), step.delayMs);
         timeoutsRef.current.push(handle);
       }
     },
@@ -412,10 +443,17 @@ export function useReturnAgent() {
         if (result.found && result.ticket) {
           ticketSeqRef.current += 1;
           setTickets((prev) => [result.ticket as ReturnTicket, ...prev]);
-          scheduleProgression(result.ticket.ticketId);
+          scheduleProgression(result.ticket);
           return { success: true, ticket: result.ticket };
         }
         return { success: false, error: result.error };
+      },
+      sendBankDetailsLink: (args) => {
+        const { result, ticket } = sendBankDetailsLinkTool(ticketsRef.current, String(args.ticketId ?? ''));
+        if (ticket) {
+          setTickets((prev) => prev.map((t) => (t.ticketId === ticket.ticketId ? ticket : t)));
+        }
+        return result;
       },
     }),
     [scheduleProgression],

@@ -41,15 +41,30 @@ export type TicketStatus =
   | 'Approved'
   | 'Pickup Scheduled'
   | 'In Transit'
-  | 'Refunded';
+  | 'Refunded'
+  | 'Awaiting Bank Details'
+  | 'Exchanged';
 
-export const TICKET_STATUS_ORDER: TicketStatus[] = [
-  'Initiated',
-  'Approved',
-  'Pickup Scheduled',
-  'In Transit',
-  'Refunded',
-];
+/**
+ * The pipeline's first four steps (courier-side: approved, scheduled,
+ * picked up) are the same for every ticket, but the LAST step depends on
+ * what actually happens to the money — a single fixed sequence ending in
+ * "Refunded" was wrong for two of the three real cases:
+ *   - exchange: nothing is ever refunded, "Refunded" never applied
+ *   - COD refund: real money can't move until the customer hands over
+ *     bank details, which this demo never collects — showing "Refunded"
+ *     here claimed a transaction that hadn't happened
+ * Only a Prepaid refund can complete on its own (refunded to the original
+ * payment method, no customer action needed), so it's the only case that
+ * still ends at "Refunded". Replaces the old single TICKET_STATUS_ORDER
+ * constant — every caller now asks for the sequence for a specific
+ * ticket rather than assuming one universal sequence applies to all.
+ */
+export function statusSequenceFor(ticket: Pick<ReturnTicket, 'resolution' | 'paymentMethod'>): TicketStatus[] {
+  const finalStep: TicketStatus =
+    ticket.resolution === 'exchange' ? 'Exchanged' : ticket.paymentMethod === 'COD' ? 'Awaiting Bank Details' : 'Refunded';
+  return ['Initiated', 'Approved', 'Pickup Scheduled', 'In Transit', finalStep];
+}
 
 export interface PickupSlot {
   slotId: string;
@@ -74,6 +89,12 @@ export interface ReturnTicket {
   refundDestination: string;
   paymentMethod: PaymentMethod;
   createdAt: number; // epoch ms
+  /** Set only once the sendBankDetailsLink tool actually runs (see
+   * tools.ts) — never set from anything the model merely says. This is
+   * what lets the ops console show, and the agent truthfully answer,
+   * whether a link was really sent for a COD refund, instead of the
+   * agent being the only record of whether that happened. */
+  bankDetailsLinkSentAt?: number;
 }
 
 export interface ChatMessage {
