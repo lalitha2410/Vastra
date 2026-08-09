@@ -40,50 +40,69 @@ Three things a buyer should walk away believing:
 
 ```bash
 npm install
-cp .env.example .env   # then add an API key for whichever provider you're using
+cp .env.example .env   # then add at least one provider's API key
 npm run dev
 ```
 
-**Two interchangeable providers**, switched with one env var:
+**Three providers with automatic fallback**, not a manual switch — every
+request tries them in this fixed order, falling through to the next one
+only on a rate-limit/quota error:
 
 ```
-VITE_LLM_PROVIDER=groq          # or "openrouter" — defaults to groq if unset
 VITE_GROQ_API_KEY=your_key_here
+VITE_CEREBRAS_API_KEY=your_key_here
 VITE_OPENROUTER_API_KEY=your_key_here
 ```
 
-You only need a key for whichever provider is active — the app reads
-`VITE_LLM_PROVIDER` and only calls that one. Both keys can sit in `.env`
-at once (harmless) so switching providers is just changing one line and
-restarting `npm run dev`, no re-entering keys.
+All three are optional — any provider with no key set is skipped
+entirely, so one key is enough to run the app. Configuring more than one
+is what makes fallback actually do something: if Groq's daily cap gets
+hit mid-conversation (a real thing that happened repeatedly during
+testing, and would just as easily kill a recruiter's live demo session),
+the very next request automatically retries on Cerebras, then OpenRouter,
+instead of surfacing an error. Once a provider rate-limits, later
+requests skip straight past it for the rest of the session (see
+`stickyProviderIndex` in `llmProvider.ts`) rather than re-trying a
+provider that's very likely still capped. Which provider served (or
+failed) each request is logged to the browser console
+(`[llmProvider] request served by …`), so fallback is visible while
+testing rather than invisible.
 
-- **Groq** (default): free key at [console.groq.com/keys](https://console.groq.com/keys).
-- **OpenRouter**: free key at [openrouter.ai/keys](https://openrouter.ai/keys).
+- **Groq** (tried first): free key at [console.groq.com/keys](https://console.groq.com/keys).
+- **Cerebras** (tried second): free key at [console.cerebras.ai](https://console.cerebras.ai).
+- **OpenRouter** (tried last): free key at [openrouter.ai/keys](https://openrouter.ai/keys).
 
-If the active provider's key is missing, the app shows a clear in-UI
-message instead of crashing (see `src/components/ApiKeyNotice.tsx`). No
-backend, no database — everything runs client-side with state held in
-React, calling the provider's `/chat/completions` API directly from the
+If every configured provider's key is missing, the app shows a clear
+in-UI message instead of crashing (see `src/components/ApiKeyNotice.tsx`).
+No backend, no database — everything runs client-side with state held in
+React, calling each provider's `/chat/completions` API directly from the
 browser.
 
-**Which model, and why:** both providers run the exact same model —
-`openai/gpt-oss-20b` — deliberately, not by coincidence. Tool calling is
-non-negotiable (most free-tier models on either provider don't support it
-at all), and having already validated this specific model's tool-chaining
-behavior extensively against our system prompt (see below), keeping the
-weights identical when adding a second provider means the only variable
-that changes is the hosting infrastructure — not the model's judgement.
+**Which models, and why:** all three run the same OpenAI open-weight
+`gpt-oss` family, deliberately, not by coincidence. Tool calling is
+non-negotiable (most free-tier models don't support it at all), and
+having already validated this model family's tool-chaining behavior
+extensively against our system prompt (see below), keeping the weights
+in the same family when adding a provider means the main variable that
+changes is the hosting infrastructure — not the model's judgement.
 
-- **Groq** (`openai/gpt-oss-20b`, no backend suffix) — added after
-  OpenRouter's free tier hit its 50-request/day account-level cap
+- **Groq** (`openai/gpt-oss-20b`, no backend suffix) — tried first. Added
+  after OpenRouter's free tier hit its 50-request/day account-level cap
   mid-testing (a hard wall, not a per-minute throttle — it doesn't clear
   until the daily reset or a credit top-up). Groq's LPU inference is also
   substantially faster, which incidentally helps the separate latency
   work already done (see "Design decisions").
-- **OpenRouter** (`openai/gpt-oss-20b:free`) — the original provider. Its
-  free-tier daily cap is real (see above) but the model is well-validated
-  there specifically: two full multi-scenario test passes with zero
-  broken tool chains.
+- **Cerebras** (`gpt-oss-120b`) — tried second, added as a third provider
+  specifically for automatic fallback (see above). The larger 120b variant
+  of the same gpt-oss family, not the smaller/preview-tier models Cerebras
+  also hosts: those weren't confirmed in Cerebras's own docs to support
+  tool calling, and `gpt-oss-120b` was — with worked tool-calling examples
+  — while also being a production-tier model, not one flagged for
+  near-term deprecation.
+- **OpenRouter** (`openai/gpt-oss-20b:free`) — tried last, the original
+  provider. Its free-tier daily cap is real (see above) but the model is
+  well-validated there specifically: two full multi-scenario test passes
+  with zero broken tool chains.
 
 **We tested OpenRouter's paid variant (`openai/gpt-oss-20b`, no `:free`
 suffix) and deliberately did not switch to it.** Same weights, meaningfully
@@ -102,9 +121,9 @@ change, not just a speed change, even at identical model weights — worth
 a few test conversations before trusting a new provider in a live demo,
 which is exactly what we did before relying on Groq (see below).
 
-To add a third provider or change either model string, everything is in
-`src/lib/llmProvider.ts` — nothing else in the app needs to change (see
-"Design decisions" below).
+To add a fourth provider, reorder the fallback chain, or change a model
+string, everything is in `src/lib/llmProvider.ts` — nothing else in the
+app needs to change (see "Design decisions" below).
 
 ## Deploying to Vercel
 
@@ -115,12 +134,12 @@ is sufficient — no `vercel.json` needed. Build command `npm run build`
 1. Push this repo to GitHub (see below).
 2. [vercel.com/new](https://vercel.com/new) → import the repo.
 3. **Add the env vars before the first build**: Project Settings →
-   Environment Variables → `VITE_LLM_PROVIDER` (`groq` or `openrouter`)
-   and the matching `VITE_GROQ_API_KEY` or `VITE_OPENROUTER_API_KEY`,
-   checked for Production/Preview/Development. Vite inlines `VITE_*` vars
-   at *build* time, so a missing key means the deployed build falls back
-   to the in-app "API key missing" screen, not a crash — but it has to be
-   set before you build, not after.
+   Environment Variables → any of `VITE_GROQ_API_KEY`,
+   `VITE_CEREBRAS_API_KEY`, `VITE_OPENROUTER_API_KEY` (all optional, at
+   least one required), checked for Production/Preview/Development. Vite
+   inlines `VITE_*` vars at *build* time, so having none set means the
+   deployed build falls back to the in-app "API key missing" screen, not a
+   crash — but keys have to be set before you build, not after.
 4. Deploy. Every push to the connected branch redeploys automatically.
 
 The key ends up in the client-side JS bundle by design (no backend to hide
@@ -166,8 +185,9 @@ beyond a live call.
 ## What's real vs. mocked
 
 **Real:**
-- Function calling (Groq or OpenRouter, both running `openai/gpt-oss-20b`
-  — see Setup) drives the entire conversation on **both channels** — order
+- Function calling (Groq, Cerebras, or OpenRouter, all running the same
+  `gpt-oss` model family, with automatic fallback between them — see
+  Setup) drives the entire conversation on **both channels** — order
   lookup, eligibility checks, size lookup, pickup slots, and ticket creation
   are actual tool calls the model makes, not scripted branching. Responses
   stream token-by-token, and the ops panel shows which tool is executing in
@@ -294,9 +314,10 @@ instruction.
 
 ## Stack
 
-Vite + React + TypeScript + Tailwind CSS v4, Groq or OpenRouter's
-OpenAI-compatible REST APIs (`openai/gpt-oss-20b`, streamed via plain
-`fetch` — no SDK), the browser's native Web Speech API for the voice
+Vite + React + TypeScript + Tailwind CSS v4, Groq/Cerebras/OpenRouter's
+OpenAI-compatible REST APIs (`gpt-oss` family, streamed via plain
+`fetch` — no SDK, with automatic rate-limit fallback across providers),
+the browser's native Web Speech API for the voice
 channel (no telephony/speech vendor, no SDK there either), no backend, no
 state management library — plain React state in `src/hooks/useReturnAgent.ts`.
 
@@ -310,7 +331,7 @@ src/
   data/scenarios.ts        # scripted "Play scenario" openers, shared by both channels
   lib/policy.ts            # deterministic eligibility rules — unchanged by adding voice
   lib/tools.ts             # pure tool implementations, incl. the duplicate-booking guard, shared by both channels
-  lib/llmProvider.ts       # the ONLY file that knows the LLM vendor(s); streaming Groq/OpenRouter client + function-calling loop — unchanged by adding voice
+  lib/llmProvider.ts       # the ONLY file that knows the LLM vendor(s); streaming Groq/Cerebras/OpenRouter client, automatic rate-limit fallback + function-calling loop — unchanged by adding voice
   lib/systemPrompt.ts      # WhatsApp channel's conversational script (not policy)
   lib/voiceSystemPrompt.ts # voice channel's conversational script — different formatting/brevity rules, same flow
   lib/formatText.ts        # chat sanitizer: renders the model's *bold* as actual bold (code enforces, not the prompt)

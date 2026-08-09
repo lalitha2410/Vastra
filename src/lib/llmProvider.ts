@@ -2,58 +2,81 @@ import type { BrandConfig } from '../config/brand';
 import { buildSystemInstruction } from './systemPrompt';
 
 /**
- * The ONLY module in the app that knows which LLM vendor is behind the
+ * The ONLY module in the app that knows which LLM vendor(s) are behind the
  * agent. `useReturnAgent.ts` (state), `tools.ts` (executors) and
  * `policy.ts` (eligibility rules) never import from here directly except
- * for the exports below — swapping vendors, or adding a second one, means
+ * for the exports below — swapping vendors, or adding another one, means
  * rewriting this one file, not touching the hook, the tools, or the UI.
  *
- * Two providers, both OpenAI-compatible chat-completions APIs, switched
- * via VITE_LLM_PROVIDER=groq|openrouter (default groq):
+ * Three providers, all OpenAI-compatible chat-completions APIs, tried
+ * automatically in a fixed fallback order on a rate-limit/quota error —
+ * see PROVIDER_ORDER and streamChatCompletion. Any provider with no API
+ * key configured is skipped entirely (see getConfiguredProviders); this
+ * only exists so a recruiter's live demo session doesn't die the moment
+ * one free-tier daily cap is hit:
  *
- * - Groq (`openai/gpt-oss-20b`) — added as a second provider after
- *   OpenRouter's free tier hit its 50-request/day account-level cap
- *   mid-testing. Deliberately the SAME model weights already validated
- *   on OpenRouter (see below), just on Groq's hosting, to keep the one
- *   variable that matters — tool-chaining reliability — as controlled as
- *   possible when switching infrastructure. Groq's LPU inference is also
- *   materially faster, which happens to help the latency problem too.
+ * - Groq (`openai/gpt-oss-20b`) — tried first. The fastest of the three
+ *   (LPU inference) and the most extensively validated against this app's
+ *   system prompt.
  *
- * - OpenRouter (`openai/gpt-oss-20b:free`) — the original provider.
- *   Picked because it's one of the few OpenRouter free-tier models whose
- *   `supported_parameters` list includes `tools`/`tool_choice` (most free
- *   models don't support function calling at all). The paid, no-`:free`
- *   variant is faster but is NOT used — see README "Design decisions":
- *   it's served by a different upstream provider and a 4-trial probe
- *   found it dropped mid-tool-chain 3 times out of 4. Reliable tool
- *   chaining outranks speed here.
+ * - Cerebras (`gpt-oss-120b`) — tried second. Same gpt-oss family as the
+ *   other two (OpenAI's own open-weight models), just the larger 120b
+ *   variant — Cerebras's smaller/preview-tier models weren't confirmed to
+ *   support tool calling in their docs, and tool calling here is
+ *   non-negotiable, so this was the one model in their production catalog
+ *   both documented as supporting it (with worked tool-calling examples)
+ *   and not flagged for near-term deprecation.
+ *
+ * - OpenRouter (`openai/gpt-oss-20b:free`) — tried last. The original
+ *   provider, kept as the final fallback. Picked originally because it's
+ *   one of the few OpenRouter free-tier models whose `supported_parameters`
+ *   list includes `tools`/`tool_choice` (most free models don't support
+ *   function calling at all). The paid, no-`:free` variant is faster but is
+ *   NOT used — see README "Design decisions": it's served by a different
+ *   upstream provider and a 4-trial probe found it dropped mid-tool-chain 3
+ *   times out of 4. Reliable tool chaining outranks speed here.
  */
 
-type LlmProviderName = 'groq' | 'openrouter';
+type LlmProviderName = 'groq' | 'cerebras' | 'openrouter';
+
+/** Fixed fallback order — not user-configurable (there's no more
+ * VITE_LLM_PROVIDER switch; every configured provider is tried
+ * automatically, in this order, per request). */
+const PROVIDER_ORDER: LlmProviderName[] = ['groq', 'cerebras', 'openrouter'];
 
 interface ProviderSpec {
+  name: LlmProviderName;
   url: string;
   model: string;
   apiKey: string | undefined;
   headers: Record<string, string>;
-  /** Same idea on both providers — trade reasoning depth for latency,
+  /** Same idea on all three providers — trade reasoning depth for latency,
    * since this agent only needs to pick the right tool and phrase a short
-   * reply — but the two APIs spell it differently: OpenRouter wants a
-   * nested `reasoning` object, Groq (following OpenAI's own gpt-oss param
-   * naming directly) wants a flat `reasoning_effort` string. */
+   * reply — but they spell it differently: OpenRouter wants a nested
+   * `reasoning` object; Groq and Cerebras (both following OpenAI's own
+   * gpt-oss param naming directly) want a flat `reasoning_effort` string. */
   reasoningParam: Record<string, unknown>;
 }
 
-function getProviderName(): LlmProviderName {
-  const raw = (import.meta.env.VITE_LLM_PROVIDER ?? '').trim().toLowerCase();
-  return raw === 'openrouter' ? 'openrouter' : 'groq';
-}
-
-function getProviderSpec(): ProviderSpec {
-  const provider = getProviderName();
-  if (provider === 'openrouter') {
+function buildProviderSpec(name: LlmProviderName): ProviderSpec {
+  if (name === 'cerebras') {
+    const key = import.meta.env.VITE_CEREBRAS_API_KEY;
+    return {
+      name,
+      url: 'https://api.cerebras.ai/v1/chat/completions',
+      model: 'gpt-oss-120b',
+      apiKey: key,
+      headers: {
+        Authorization: `Bearer ${key ?? ''}`,
+        'Content-Type': 'application/json',
+      },
+      reasoningParam: { reasoning_effort: 'low' },
+    };
+  }
+  if (name === 'openrouter') {
     const key = import.meta.env.VITE_OPENROUTER_API_KEY;
     return {
+      name,
       url: 'https://openrouter.ai/api/v1/chat/completions',
       model: 'openai/gpt-oss-20b:free',
       apiKey: key,
@@ -67,6 +90,7 @@ function getProviderSpec(): ProviderSpec {
   }
   const key = import.meta.env.VITE_GROQ_API_KEY;
   return {
+    name,
     url: 'https://api.groq.com/openai/v1/chat/completions',
     model: 'openai/gpt-oss-20b',
     apiKey: key,
@@ -78,18 +102,22 @@ function getProviderSpec(): ProviderSpec {
   };
 }
 
-export function getApiKey(): string | undefined {
-  return getProviderSpec().apiKey;
+/** Providers with a configured, non-empty API key, in fallback order.
+ * Empty means no provider is usable at all — see hasApiKey/ApiKeyNotice. */
+function getConfiguredProviders(): ProviderSpec[] {
+  return PROVIDER_ORDER.map(buildProviderSpec).filter((p) => Boolean(p.apiKey && p.apiKey.trim().length > 0));
 }
 
 export function hasApiKey(): boolean {
-  const key = getApiKey();
-  return Boolean(key && key.trim().length > 0);
+  return getConfiguredProviders().length > 0;
 }
 
-/** Display-only info about whichever provider is active, so the UI (missing-key
- * screen, chat placeholder, error text) never hardcodes a vendor name — it asks
- * this module, same as everything else that needs to know which vendor is live. */
+/** Display-only info about a provider, so the UI (missing-key screen, chat
+ * placeholder) never hardcodes a vendor name — it asks this module, same
+ * as everything else that needs to know which vendor is live. Only ever
+ * rendered when hasApiKey() is false (no provider configured at all), so
+ * this always points at the first provider in fallback order — asking for
+ * a Groq key is the right default prompt in that state. */
 export interface ProviderDisplayInfo {
   name: string;
   keyUrl: string;
@@ -102,6 +130,11 @@ const PROVIDER_DISPLAY: Record<LlmProviderName, ProviderDisplayInfo> = {
     keyUrl: 'https://console.groq.com/keys',
     envVarName: 'VITE_GROQ_API_KEY',
   },
+  cerebras: {
+    name: 'Cerebras',
+    keyUrl: 'https://console.cerebras.ai',
+    envVarName: 'VITE_CEREBRAS_API_KEY',
+  },
   openrouter: {
     name: 'OpenRouter',
     keyUrl: 'https://openrouter.ai/keys',
@@ -110,10 +143,10 @@ const PROVIDER_DISPLAY: Record<LlmProviderName, ProviderDisplayInfo> = {
 };
 
 export function getActiveProvider(): ProviderDisplayInfo {
-  return PROVIDER_DISPLAY[getProviderName()];
+  return PROVIDER_DISPLAY[PROVIDER_ORDER[0]];
 }
 
-// --- OpenAI-style tool declarations (both providers' chat completions
+// --- OpenAI-style tool declarations (all three providers' chat completions
 // APIs are OpenAI-compatible, so tools are described the same way
 // regardless of which one answers). ---
 
@@ -240,10 +273,12 @@ interface ChatCompletionMessage {
 }
 
 /**
- * Stateless REST APIs need the caller to resend the whole transcript each
- * turn (unlike Gemini's stateful ChatSession, from before this app's
- * first provider migration) — this is just that transcript, held for the
- * lifetime of one conversation.
+ * Stateless REST APIs need the caller to resend context each turn (unlike
+ * Gemini's stateful ChatSession, from before this app's first provider
+ * migration) — this is the complete local record of one conversation,
+ * held for its lifetime. It is NOT what gets sent on the wire, though:
+ * see buildRequestMessages, which sends a bounded recent-message window
+ * plus a summary instead of resending this whole array every round trip.
  */
 export interface ChatSession {
   messages: ChatCompletionMessage[];
@@ -258,21 +293,84 @@ interface StreamResult {
   toolCalls: ToolCall[];
 }
 
+/** How many non-system messages to send verbatim — enough to cover the
+ * customer's most recent answer plus the immediately preceding tool round
+ * trip, everything older is represented by the caller's summary instead. */
+const RECENT_MESSAGE_WINDOW = 6;
+
 /**
- * Streams one chat completion, invoking `onTextDelta` with the
- * accumulated visible text as tokens arrive (never with reasoning tokens —
- * those are dropped so the model's internal chain-of-thought never leaks
- * into the chat). Tool-call argument fragments are accumulated by index
- * per OpenAI's streaming tool-call format and returned whole at the end,
- * since a tool can only be executed once its full arguments are known.
- * The SSE format itself is identical across both providers (both are
- * OpenAI-compatible), so only request construction is provider-specific.
+ * Builds what actually gets sent over the wire: the system prompt, an
+ * optional one-line recap of facts established earlier in the
+ * conversation, then only the most recent messages — not the full,
+ * ever-growing `chat.messages` array. `chat.messages` itself is untouched
+ * by this (still a complete local record); only the per-request payload
+ * is bounded, which is what the token/rate-limit budget actually cares
+ * about.
+ *
+ * The cutoff always lands on a `user` message boundary, never mid-way
+ * through a tool-call/tool-response pair — slicing at an arbitrary index
+ * could send an orphaned `tool` message with no matching preceding
+ * `assistant` tool_calls, which every OpenAI-compatible API rejects.
+ * Each turn's tool round trip is fully contained between one `user`
+ * message and the next, so walking forward from the naive cutoff to the
+ * next `user` message is always safe and never discards more than
+ * necessary.
+ *
+ * The summary is deliberately opaque here — this module has no idea what
+ * "order ID" or "reason" mean, and shouldn't (see the file-level comment).
+ * It's just a caller-supplied string slotted in as an extra system
+ * message; the returns-domain logic that builds it lives entirely in
+ * useReturnAgent.ts.
  */
-async function streamChatCompletion(
+function buildRequestMessages(fullHistory: ChatCompletionMessage[], contextSummary?: string): ChatCompletionMessage[] {
+  const [systemMsg, ...rest] = fullHistory;
+  let cutoff = Math.max(0, rest.length - RECENT_MESSAGE_WINDOW);
+  while (cutoff < rest.length && rest[cutoff].role !== 'user') cutoff += 1;
+  const recent = rest.slice(cutoff);
+
+  if (!contextSummary) return [systemMsg, ...recent];
+  const summaryMsg: ChatCompletionMessage = {
+    role: 'system',
+    content: `Context established earlier in this conversation (do not re-ask for these): ${contextSummary}`,
+  };
+  return [systemMsg, summaryMsg, ...recent];
+}
+
+/** Matches the same rate-limit/quota wording useReturnAgent.ts's own
+ * isQuotaError checks for — this is the ONLY error class that triggers
+ * automatic provider fallback (see streamChatCompletion). Anything else
+ * (bad request, auth failure, network error) surfaces immediately instead
+ * of being silently retried on a different vendor, so a real bug doesn't
+ * masquerade as "it just worked eventually." */
+function isRateLimitOrQuotaError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return message.includes('429') || lower.includes('quota') || lower.includes('rate limit');
+}
+
+/** Index into getConfiguredProviders() to try first. Starts at 0 (highest-
+ * priority configured provider) and only ever moves forward: these are
+ * daily caps, so once a provider rate-limits there's no point re-trying it
+ * on the very next request for the rest of the session — this just
+ * remembers "skip straight to the one that's still working." Resets on
+ * page reload, which is fine since the caps themselves reset daily. */
+let stickyProviderIndex = 0;
+
+/**
+ * Streams one chat completion from one specific provider, invoking
+ * `onTextDelta` with the accumulated visible text as tokens arrive (never
+ * with reasoning tokens — those are dropped so the model's internal
+ * chain-of-thought never leaks into the chat). Tool-call argument
+ * fragments are accumulated by index per OpenAI's streaming tool-call
+ * format and returned whole at the end, since a tool can only be executed
+ * once its full arguments are known. The SSE format itself is identical
+ * across all three providers (all OpenAI-compatible), so only request
+ * construction is provider-specific.
+ */
+async function streamChatCompletionOnce(
+  spec: ProviderSpec,
   messages: ChatCompletionMessage[],
   onTextDelta?: (textSoFar: string) => void,
 ): Promise<StreamResult> {
-  const spec = getProviderSpec();
   const res = await fetch(spec.url, {
     method: 'POST',
     headers: spec.headers,
@@ -288,7 +386,7 @@ async function streamChatCompletion(
 
   if (!res.ok || !res.body) {
     const body = await res.text().catch(() => '');
-    throw new Error(`${getProviderName()} request failed: ${res.status} ${res.statusText} ${body}`);
+    throw new Error(`${spec.name} request failed: ${res.status} ${res.statusText} ${body}`);
   }
 
   const reader = res.body.getReader();
@@ -348,11 +446,73 @@ async function streamChatCompletion(
 }
 
 /**
+ * Tries each configured provider in fallback order, starting from
+ * `stickyProviderIndex`, advancing to the next only on a rate-limit/quota
+ * error — including the "empty completion" symptom of one, checked here so
+ * it participates in fallback too (see the comment below). Any other error
+ * type surfaces immediately without trying further providers. Logs which
+ * provider served (or failed) each request to the console, so fallback
+ * behavior is visible while testing. Only once every configured provider
+ * has failed does this throw — and that final error still carries "rate
+ * limit" wording, so the hook's existing isQuotaError check renders the
+ * same friendly message it always has.
+ */
+async function streamChatCompletion(
+  messages: ChatCompletionMessage[],
+  onTextDelta?: (textSoFar: string) => void,
+): Promise<StreamResult> {
+  const providers = getConfiguredProviders();
+  if (providers.length === 0) {
+    throw new Error('No LLM provider configured — add at least one API key (see .env.example).');
+  }
+  if (stickyProviderIndex >= providers.length) stickyProviderIndex = providers.length - 1;
+
+  let lastError: unknown;
+  for (let i = stickyProviderIndex; i < providers.length; i += 1) {
+    const spec = providers[i];
+    try {
+      const result = await streamChatCompletionOnce(spec, messages, onTextDelta);
+
+      // A completion with no tool calls AND no text is not a valid reply —
+      // seen in practice as a stream that returns 200 and a normal-looking
+      // SSE sequence, but gets cut off mid-generation by a per-minute
+      // token cap before any content token is emitted. Nothing upstream
+      // throws for this (the HTTP request genuinely succeeded), so it's
+      // treated as a rate-limit symptom and falls through to the next
+      // provider exactly like an explicit 429 would.
+      if (!result.content.trim() && result.toolCalls.length === 0) {
+        throw new Error(`${spec.name} returned an empty completion (rate limit likely truncated the stream mid-generation)`);
+      }
+
+      stickyProviderIndex = i;
+      console.log(`[llmProvider] request served by ${spec.name}${i > 0 ? ' (fallback)' : ''}`);
+      return result;
+    } catch (err) {
+      lastError = err;
+      const message = err instanceof Error ? err.message : String(err);
+      if (!isRateLimitOrQuotaError(message)) throw err;
+      const next = providers[i + 1];
+      console.warn(
+        `[llmProvider] ${spec.name} rate-limited/quota exceeded${next ? `, falling back to ${next.name}…` : ' — no more providers configured.'}`,
+        message,
+      );
+      stickyProviderIndex = i + 1;
+    }
+  }
+
+  const triedNames = providers.map((p) => p.name).join(', ');
+  const lastMessage = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(`All configured providers hit their rate limit or quota (tried: ${triedNames}). Last error: ${lastMessage}`);
+}
+
+/**
  * Sends a user message, running the function-calling loop until the model
  * returns plain text. `executors` maps tool name -> implementation; each
  * executor is expected to read/mutate app state (which drives the ops
  * dashboard) and return JSON-serializable data for the model to read back.
  * `onTextDelta` streams the final reply into the UI as it's generated.
+ * `contextSummary`, if given, stands in for everything older than the
+ * recent-message window sent on the wire — see buildRequestMessages.
  */
 export async function sendAgentMessage(
   chat: ChatSession,
@@ -360,13 +520,15 @@ export async function sendAgentMessage(
   executors: ToolExecutorMap,
   onToolCall?: (name: string, args: Record<string, unknown>, result: unknown) => void,
   onTextDelta?: (textSoFar: string) => void,
+  contextSummary?: string,
 ): Promise<string> {
   chat.messages.push({ role: 'user', content: message });
 
   let guard = 0;
   while (guard < 6) {
     guard += 1;
-    const { content, toolCalls } = await streamChatCompletion(chat.messages, onTextDelta);
+    const requestMessages = buildRequestMessages(chat.messages, contextSummary);
+    const { content, toolCalls } = await streamChatCompletion(requestMessages, onTextDelta);
 
     if (toolCalls.length > 0) {
       chat.messages.push({ role: 'assistant', content: content || null, tool_calls: toolCalls });
@@ -388,22 +550,6 @@ export async function sendAgentMessage(
         });
       }
       continue;
-    }
-
-    // A completion with no tool calls AND no text is not a valid reply —
-    // seen in practice as a Groq stream that returns 200 and a normal-
-    // looking SSE sequence, but gets cut off mid-generation by the
-    // per-minute token cap before any content token is emitted. Nothing
-    // upstream throws for this (the HTTP request genuinely succeeded), so
-    // without this check it silently resolves as an empty string and the
-    // hook renders a bubble with a timestamp and no text. Throwing here
-    // routes it through the hook's existing catch block instead, which
-    // already renders a proper rate-limit message — one failure path,
-    // not two.
-    if (!content.trim()) {
-      throw new Error(
-        `${getProviderName()} returned an empty completion (rate limit likely truncated the stream mid-generation)`,
-      );
     }
 
     chat.messages.push({ role: 'assistant', content });

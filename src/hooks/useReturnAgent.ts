@@ -95,6 +95,108 @@ function isQuotaError(raw: string): boolean {
   return raw.includes('429') || lower.includes('quota') || lower.includes('rate limit');
 }
 
+/**
+ * llmProvider.ts only sends the model a bounded recent-message window per
+ * request (see buildRequestMessages there) — everything older is dropped
+ * unless it's captured here first. This is the domain-specific half of
+ * that trade: llmProvider.ts stays vendor-only and has no idea what
+ * "order ID" or "reason" mean, so the facts worth remembering, and how to
+ * extract them, live here instead, built entirely from structured tool
+ * calls/results — never by re-reading or guessing from prose — same
+ * "tools decide, code enforces" principle as the policy engine.
+ *
+ * `reason` is the one fact no tool ever receives before createReturnTicket
+ * is finally called (none of the earlier tools take it as an argument),
+ * so it can't be read off a tool result the way everything else here can.
+ * Instead it's captured positionally: the system prompt's own step 3
+ * always asks for it immediately after step 2's eligibility check
+ * resolves, so the customer's next message once `awaitingReason` is set
+ * is captured verbatim as the reason. Deterministic and tied to a
+ * structured event (a tool call resolving), not pattern-matching on text.
+ */
+interface ConversationFacts {
+  orderId?: string;
+  itemId?: string;
+  itemName?: string;
+  eligible?: boolean;
+  ineligibleReason?: string;
+  awaitingReason?: boolean;
+  reason?: string;
+  availableSizes?: string[];
+  pickupSlots?: { slotId: string; label: string }[];
+  ticketId?: string;
+  resolution?: string;
+  exchangeSize?: string;
+  pickupLabel?: string;
+}
+
+function updateFacts(facts: ConversationFacts, name: string, args: Record<string, unknown>, result: unknown): void {
+  const r = result as Record<string, unknown> | undefined;
+  switch (name) {
+    case 'checkReturnEligibility':
+      if (r?.found) {
+        facts.orderId = String(args.orderId ?? facts.orderId ?? '');
+        facts.itemId = String(args.itemId ?? facts.itemId ?? '');
+        facts.itemName = r.itemName as string | undefined;
+        facts.eligible = r.eligible as boolean | undefined;
+        facts.ineligibleReason = r.eligible ? undefined : ((r.reasons as string[] | undefined) ?? []).join(' ');
+        facts.awaitingReason = r.eligible === true;
+      }
+      break;
+    case 'getAvailableSizes':
+      if (r?.found) facts.availableSizes = r.availableSizes as string[] | undefined;
+      break;
+    case 'getPickupSlots':
+      if (Array.isArray(result)) {
+        facts.pickupSlots = result.map((s) => ({ slotId: s.slotId, label: s.label }));
+      }
+      break;
+    case 'createReturnTicket':
+      if (r?.success && r.ticket) {
+        const t = r.ticket as ReturnTicket;
+        facts.ticketId = t.ticketId;
+        facts.resolution = t.resolution;
+        facts.exchangeSize = t.exchangeSize;
+        facts.pickupLabel = t.slot?.label;
+        facts.awaitingReason = false;
+      }
+      break;
+  }
+}
+
+/** The customer's next message after eligibility resolves eligible is
+ * their answer to "why do you want to return it" — see ConversationFacts'
+ * doc comment. Called right before building this turn's context summary,
+ * so a reason stated in the PREVIOUS turn is captured before it can fall
+ * out of the recent-message window in some future turn. */
+function captureReasonIfAwaited(facts: ConversationFacts, incomingMessage: string): void {
+  if (facts.awaitingReason) {
+    facts.reason = incomingMessage;
+    facts.awaitingReason = false;
+  }
+}
+
+function factsToSummary(f: ConversationFacts): string {
+  const parts: string[] = [];
+  if (f.orderId) parts.push(`order ${f.orderId}`);
+  if (f.itemName) parts.push(`item "${f.itemName}"${f.itemId ? ` (${f.itemId})` : ''}`);
+  if (f.eligible === true) parts.push('confirmed eligible for return/exchange');
+  if (f.eligible === false) parts.push(`confirmed NOT eligible (${f.ineligibleReason || 'see policy'}) — do not proceed further`);
+  if (f.reason) parts.push(`customer's stated reason: "${f.reason}"`);
+  if (f.availableSizes?.length) parts.push(`sizes in stock: ${f.availableSizes.join(', ')}`);
+  if (f.pickupSlots?.length) {
+    parts.push(`pickup slots offered: ${f.pickupSlots.map((s) => `${s.slotId}=${s.label}`).join('; ')}`);
+  }
+  if (f.ticketId) {
+    parts.push(
+      `ticket ${f.ticketId} already created (${f.resolution}${f.exchangeSize ? ` → ${f.exchangeSize}` : ''}${
+        f.pickupLabel ? `, ${f.pickupLabel}` : ''
+      }) — do NOT create another`,
+    );
+  }
+  return parts.join('. ');
+}
+
 export function useReturnAgent() {
   const [brand, setBrandState] = useState<BrandConfig>(vastraBrand);
   const [channel, setChannel] = useState<Channel>('whatsapp');
@@ -202,6 +304,7 @@ export function useReturnAgent() {
   const [chatToolActivity, setChatToolActivity] = useState<string | null>(null);
   const [chatStreamingText, setChatStreamingText] = useState('');
   const chatSessionRef = useRef<ChatSession | null>(null);
+  const chatFactsRef = useRef<ConversationFacts>({});
 
   if (!chatSessionRef.current && !apiKeyMissing) {
     chatSessionRef.current = newSession(buildSystemInstruction(brand));
@@ -216,14 +319,19 @@ export function useReturnAgent() {
       setChatIsTyping(true);
       setChatToolActivity(CHAT_THINKING_LABEL);
       setChatStreamingText('');
+      captureReasonIfAwaited(chatFactsRef.current, trimmed);
       try {
         const executors = buildExecutors(brandRef.current);
         const reply = await sendAgentMessage(
           chatSessionRef.current,
           trimmed,
           executors,
-          (name) => setChatToolActivity(TOOL_ACTIVITY_LABELS[name] ?? name),
+          (name, args, result) => {
+            setChatToolActivity(TOOL_ACTIVITY_LABELS[name] ?? name);
+            updateFacts(chatFactsRef.current, name, args, result);
+          },
           (textSoFar) => setChatStreamingText(textSoFar),
+          factsToSummary(chatFactsRef.current),
         );
         setChatMessages((prev) => [...prev, { id: uid(), role: 'agent', text: reply, timestamp: Date.now() }]);
       } catch (err) {
@@ -255,6 +363,7 @@ export function useReturnAgent() {
   const [voiceToolActivity, setVoiceToolActivity] = useState<string | null>(null);
   const [voiceStreamingText, setVoiceStreamingText] = useState('');
   const voiceSessionRef = useRef<ChatSession | null>(null);
+  const voiceFactsRef = useRef<ConversationFacts>({});
   const callStartRef = useRef<number | null>(null);
   // Mirrors of state an async/stable callback needs the *current* value of
   // (same reasoning as ticketsRef above) — callMessagesRef so endCall can
@@ -294,6 +403,7 @@ export function useReturnAgent() {
     setVoiceToolActivity(null);
     setVoiceStreamingText('');
     setIsProcessingVoice(false);
+    voiceFactsRef.current = {};
     if (!apiKeyMissing) {
       voiceSessionRef.current = newSession(buildVoiceSystemInstruction(brandRef.current));
     }
@@ -342,14 +452,19 @@ export function useReturnAgent() {
       setIsProcessingVoice(true);
       setVoiceToolActivity(VOICE_THINKING_LABEL);
       setVoiceStreamingText('');
+      captureReasonIfAwaited(voiceFactsRef.current, trimmed);
       try {
         const executors = buildExecutors(brandRef.current);
         const reply = await sendAgentMessage(
           voiceSessionRef.current,
           trimmed,
           executors,
-          (name) => setVoiceToolActivity(TOOL_ACTIVITY_LABELS[name] ?? name),
+          (name, args, result) => {
+            setVoiceToolActivity(TOOL_ACTIVITY_LABELS[name] ?? name);
+            updateFacts(voiceFactsRef.current, name, args, result);
+          },
           (textSoFar) => setVoiceStreamingText(textSoFar),
+          factsToSummary(voiceFactsRef.current),
         );
         setCallMessages((prev) => [...prev, { id: uid(), role: 'agent', text: reply, timestamp: Date.now() }]);
         speakAgentLine(reply);
@@ -389,6 +504,7 @@ export function useReturnAgent() {
       setChatStreamingText('');
       setChatIsTyping(false);
       chatSessionRef.current = apiKeyMissing ? null : newSession(buildSystemInstruction(nextBrand));
+      chatFactsRef.current = {};
 
       tts.cancel();
       callStartRef.current = null;
@@ -400,6 +516,7 @@ export function useReturnAgent() {
       setVoiceStreamingText('');
       setIsProcessingVoice(false);
       voiceSessionRef.current = null;
+      voiceFactsRef.current = {};
     },
     [apiKeyMissing, clearAllTimeouts, tts],
   );
