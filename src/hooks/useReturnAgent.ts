@@ -1,16 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { BrandConfig } from '../config/brand';
 import { getBrandById, vastraBrand } from '../config/brand';
-import {
-  statusSequenceFor,
-  type CallLogEntry,
-  type CallStatus,
-  type Channel,
-  type ChatMessage,
-  type ReturnTicket,
-  type TicketStatus,
-  type TranscriptEntry,
-} from '../types';
+import type { CallLogEntry, CallStatus, Channel, ChatMessage, ReturnTicket, TranscriptEntry } from '../types';
 import {
   getActiveProvider,
   hasApiKey,
@@ -85,20 +76,6 @@ function newSession(systemInstruction: string): ChatSession {
   return { messages: [{ role: 'system', content: systemInstruction }] };
 }
 
-// Compressed, demo-friendly timeline so the ops dashboard visibly finishes
-// its pipeline during a live call instead of sitting at "Pickup Scheduled".
-// The four delays are fixed regardless of ticket type — only the final
-// status label changes (see statusSequenceFor in types.ts), so a COD
-// refund's pipeline correctly stops at "Awaiting Bank Details" instead of
-// auto-completing to "Refunded", a transaction that hasn't actually
-// happened in this demo (no bank details are ever collected).
-const PROGRESSION_DELAYS_MS = [1200, 2600, 7000, 12000];
-
-function progressionFor(ticket: Pick<ReturnTicket, 'resolution' | 'paymentMethod'>): { status: TicketStatus; delayMs: number }[] {
-  const [, ...steps] = statusSequenceFor(ticket); // drop 'Initiated' — that's the status at creation, not a scheduled step
-  return steps.map((status, i) => ({ status, delayMs: PROGRESSION_DELAYS_MS[i] }));
-}
-
 export interface Stats {
   returnsToday: number;
   exchangeCount: number;
@@ -160,6 +137,10 @@ interface ConversationFacts {
   pickupSlots?: { slotId: string; label: string }[];
   pickupLabel?: string;
   ticketId?: string;
+  /** The candidate list a pending 'item' capture resolves against — see
+   * pendingCapture below. Set alongside pendingCapture='item', cleared
+   * once it resolves (or the order turns out to have just one item). */
+  pendingItemOptions?: { itemId: string; name: string }[];
   /** Only true once sendBankDetailsLink actually ran (see tools.ts) —
    * this is what lets the summary tell the model "already sent, don't
    * send or claim to send again" instead of the model being the only
@@ -172,7 +153,7 @@ interface ConversationFacts {
    * later tool calls in the same turn simply overwrite an earlier one,
    * which matches the flow: the model doesn't ask two different
    * open questions in a row. */
-  pendingCapture?: 'reason' | 'exchangeSize' | 'slot';
+  pendingCapture?: 'item' | 'reason' | 'exchangeSize' | 'slot';
 }
 
 // The exact digit order step 3 of the system prompt declares ("map their
@@ -188,9 +169,19 @@ const REASON_BY_DIGIT: Record<string, string> = {
   '4': 'changed_mind',
 };
 
-function leadingDigit(text: string): string | null {
-  const m = text.trim().match(/^([1-9])\b/);
-  return m ? m[1] : null;
+/** The customer's whole reply as a number, if that's all it is (leading
+ * digits up to a word boundary) — e.g. "2" -> 2, "14" -> 14, "2 please" ->
+ * 2. Deliberately NOT capped at a single digit: an earlier version only
+ * matched [1-9], which meant an out-of-range reply like "14" or "6" was
+ * silently invisible to this code and fell through to the model to
+ * interpret on its own — which is exactly how it ended up guessing a
+ * plausible-looking but wrong option instead of the customer's mistyped
+ * one. Used for both resolving a valid choice (captureNextReply) and
+ * rejecting an invalid one (validatePendingChoice) against the same
+ * number. */
+function fullNumeral(text: string): number | null {
+  const m = text.trim().match(/^(\d+)\b/);
+  return m ? Number(m[1]) : null;
 }
 
 function updateFacts(facts: ConversationFacts, name: string, args: Record<string, unknown>, result: unknown): void {
@@ -218,6 +209,15 @@ function updateFacts(facts: ConversationFacts, name: string, args: Record<string
         if (orders[0].items.length === 1) {
           facts.itemId = orders[0].items[0].itemId;
           facts.itemName = orders[0].items[0].name;
+        } else if (orders[0].items.length > 1) {
+          // Ambiguous — the model still has to ask which item. Recording
+          // the actual candidate list (not just noting "ambiguous") is
+          // what lets validatePendingChoice bounds-check a numbered reply
+          // against how many items there really are, instead of the
+          // model silently picking one for an out-of-range answer like
+          // "14" on a 2-item order.
+          facts.pendingItemOptions = orders[0].items;
+          facts.pendingCapture = 'item';
         }
       }
       break;
@@ -290,12 +290,65 @@ function updateFacts(facts: ConversationFacts, name: string, args: Record<string
 // is rejected regardless of what the true answer later turns out to be.
 const BARE_ACKNOWLEDGEMENTS = new Set(['yes', 'yeah', 'yep', 'yup', 'sure', 'ok', 'okay', 'y', 'no', 'nope', 'n']);
 
+/** How many real options exist for whatever's currently pending, or
+ * undefined if that can't be determined yet (e.g. pickupSlots hasn't
+ * loaded). Reason is always exactly the 4 keys in REASON_BY_DIGIT — not
+ * dependent on anything having been fetched yet. */
+function pendingOptionCount(facts: ConversationFacts): number | undefined {
+  switch (facts.pendingCapture) {
+    case 'item':
+      return facts.pendingItemOptions?.length;
+    case 'reason':
+      return Object.keys(REASON_BY_DIGIT).length;
+    case 'exchangeSize':
+      return facts.availableSizes?.length;
+    case 'slot':
+      return facts.pickupSlots?.length;
+    default:
+      return undefined;
+  }
+}
+
+const PENDING_CAPTURE_LABEL: Record<NonNullable<ConversationFacts['pendingCapture']>, string> = {
+  item: 'which item',
+  reason: 'the return reason',
+  exchangeSize: 'which size',
+  slot: 'which pickup slot',
+};
+
+/**
+ * The code-level guard the tools themselves can't provide: nothing in
+ * llmProvider.ts's tool schema stops the model from picking a
+ * plausible-looking option when a customer's numbered reply is out of
+ * range ("14" on a 2-item order, "6" on a 4-option reason list) — the
+ * model just picks something instead of asking again, seen live on
+ * VS1002. This runs BEFORE the message ever reaches the model: if the
+ * customer's whole reply is a number and it's outside the range of
+ * whatever's actually pending, the turn never becomes an LLM call at all
+ * — the caller shows a direct rejection and waits for a real answer,
+ * exactly like a bounds check in the policy engine would. A prose reply,
+ * an in-range number, or nothing pending all fall through untouched.
+ */
+function validatePendingChoice(facts: ConversationFacts, incomingMessage: string): string | undefined {
+  if (!facts.pendingCapture) return undefined;
+  const n = fullNumeral(incomingMessage);
+  if (n === null) return undefined;
+  const count = pendingOptionCount(facts);
+  if (count === undefined || (n >= 1 && n <= count)) return undefined;
+  const label = PENDING_CAPTURE_LABEL[facts.pendingCapture];
+  return count === 1
+    ? `I only have option 1 for ${label} — did you mean that one?`
+    : `I only have options 1–${count} for ${label} — which did you mean?`;
+}
+
 /**
  * Captures the customer's next message as the answer to whichever
  * question is currently pending (see ConversationFacts.pendingCapture),
  * called right before building this turn's context summary so an answer
  * given in the PREVIOUS turn is captured before it can fall out of the
- * recent-message window in some future turn.
+ * recent-message window in some future turn. Only ever called with a
+ * message validatePendingChoice has already approved (in range, or not a
+ * bare numeral at all) — this function itself doesn't re-check bounds.
  *
  * The one place this maps rather than stores verbatim: a bare numeral
  * reply to the reason question ("2") is meaningless on its own once it's
@@ -303,11 +356,12 @@ const BARE_ACKNOWLEDGEMENTS = new Set(['yes', 'yeah', 'yep', 'yup', 'sure', 'ok'
  * the summary reads to the model as a fact, not a list index, and was
  * observed live confusing it into re-asking the same question. Resolved
  * against REASON_BY_DIGIT, which mirrors the system prompt's own fixed
- * numbering — not a guess about intent, just decoding our own list.
- * Pickup-slot numerals are resolved the same way, against whatever slots
- * were actually offered this conversation (`facts.pickupSlots`) rather
- * than a hardcoded table, since slot order is generated, not fixed prompt
- * text. Everything else (item size, prose reasons) is stored as-is.
+ * numbering — not a guess about intent, just decoding our own list. Item
+ * and pickup-slot numerals are resolved the same way, against whatever
+ * was actually offered this conversation (`pendingItemOptions` /
+ * `pickupSlots`) rather than a hardcoded table, since those lists are
+ * generated, not fixed prompt text. Everything else (item name typed as
+ * prose, exchange size) is stored as-is.
  *
  * Leaves `pendingCapture` set on a bare acknowledgement so the next real
  * answer still gets captured — `createReturnTicket`'s handler in
@@ -318,9 +372,21 @@ function captureNextReply(facts: ConversationFacts, incomingMessage: string): vo
   const trimmed = incomingMessage.trim();
   if (BARE_ACKNOWLEDGEMENTS.has(trimmed.toLowerCase())) return;
 
+  if (facts.pendingCapture === 'item') {
+    const n = fullNumeral(trimmed);
+    const options = facts.pendingItemOptions;
+    const matched = n && options ? options[n - 1] : undefined;
+    if (matched) {
+      facts.itemId = matched.itemId;
+      facts.itemName = matched.name;
+    }
+    facts.pendingItemOptions = undefined;
+    facts.pendingCapture = undefined;
+    return;
+  }
   if (facts.pendingCapture === 'reason') {
-    const digit = leadingDigit(trimmed);
-    facts.reason = (digit && REASON_BY_DIGIT[digit]) || trimmed;
+    const n = fullNumeral(trimmed);
+    facts.reason = (n && REASON_BY_DIGIT[String(n)]) || trimmed;
     // Deterministic business rule (see systemPrompt.ts step 4), not a
     // guess about customer intent: only "size" ever goes through the
     // exchange path, so any other reason means the resolution is already
@@ -336,9 +402,9 @@ function captureNextReply(facts: ConversationFacts, incomingMessage: string): vo
     return;
   }
   // 'slot'
-  const digit = leadingDigit(trimmed);
+  const n = fullNumeral(trimmed);
   const bySlots = facts.pickupSlots;
-  const matched = digit && bySlots ? bySlots[Number(digit) - 1] : undefined;
+  const matched = n && bySlots ? bySlots[n - 1] : undefined;
   facts.pickupLabel = matched ? matched.label : trimmed;
   facts.pendingCapture = undefined;
 }
@@ -395,27 +461,6 @@ export function useReturnAgent() {
   useEffect(() => {
     ticketsRef.current = tickets;
   }, [tickets]);
-  const timeoutsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
-
-  const updateTicketStatus = useCallback((ticketId: string, status: TicketStatus) => {
-    setTickets((prev) => prev.map((t) => (t.ticketId === ticketId ? { ...t, status } : t)));
-  }, []);
-
-  const scheduleProgression = useCallback(
-    (ticket: Pick<ReturnTicket, 'ticketId' | 'resolution' | 'paymentMethod'>) => {
-      for (const step of progressionFor(ticket)) {
-        const handle = setTimeout(() => updateTicketStatus(ticket.ticketId, step.status), step.delayMs);
-        timeoutsRef.current.push(handle);
-      }
-    },
-    [updateTicketStatus],
-  );
-
-  const clearAllTimeouts = useCallback(() => {
-    timeoutsRef.current.forEach((h) => clearTimeout(h));
-    timeoutsRef.current = [];
-  }, []);
-
   // Executors run inside an async tool-call loop (see sendAgentMessage), so
   // they need the *current* ticket list at call time for the duplicate-
   // booking guard, not whatever was in scope when this closure was built —
@@ -443,7 +488,6 @@ export function useReturnAgent() {
         if (result.found && result.ticket) {
           ticketSeqRef.current += 1;
           setTickets((prev) => [result.ticket as ReturnTicket, ...prev]);
-          scheduleProgression(result.ticket);
           return { success: true, ticket: result.ticket };
         }
         return { success: false, error: result.error };
@@ -456,7 +500,7 @@ export function useReturnAgent() {
         return result;
       },
     }),
-    [scheduleProgression],
+    [],
   );
 
   const stats: Stats = useMemo(() => {
@@ -500,6 +544,16 @@ export function useReturnAgent() {
       if (!trimmed || apiKeyMissing || !chatSessionRef.current) return;
 
       setChatMessages((prev) => [...prev, { id: uid(), role: 'user', text: trimmed, timestamp: Date.now() }]);
+
+      // Bounds-checked in code before this ever becomes a model turn — see
+      // validatePendingChoice's own comment. No tool call, no LLM request,
+      // just an immediate correction while the real question stays open.
+      const rejection = validatePendingChoice(chatFactsRef.current, trimmed);
+      if (rejection) {
+        setChatMessages((prev) => [...prev, { id: uid(), role: 'agent', text: rejection, timestamp: Date.now() }]);
+        return;
+      }
+
       setChatIsTyping(true);
       setChatToolActivity(CHAT_THINKING_LABEL);
       setChatStreamingText('');
@@ -635,6 +689,17 @@ export function useReturnAgent() {
       if (!trimmed || apiKeyMissing || !voiceSessionRef.current || !callActive) return;
 
       setCallMessages((prev) => [...prev, { id: uid(), role: 'user', text: trimmed, timestamp: Date.now() }]);
+
+      // Same bounds check as the chat channel — see validatePendingChoice.
+      // Spoken immediately rather than routed through the model, same as
+      // any other agent line on this channel.
+      const rejection = validatePendingChoice(voiceFactsRef.current, trimmed);
+      if (rejection) {
+        setCallMessages((prev) => [...prev, { id: uid(), role: 'agent', text: rejection, timestamp: Date.now() }]);
+        speakAgentLine(rejection);
+        return;
+      }
+
       setIsProcessingVoice(true);
       setVoiceToolActivity(VOICE_THINKING_LABEL);
       setVoiceStreamingText('');
@@ -683,7 +748,6 @@ export function useReturnAgent() {
   // ---------------------------------------------------------------------
   const resetAllFor = useCallback(
     (nextBrand: BrandConfig) => {
-      clearAllTimeouts();
       ticketSeqRef.current = 0;
       setTickets([]);
 
@@ -706,7 +770,7 @@ export function useReturnAgent() {
       voiceSessionRef.current = null;
       voiceFactsRef.current = {};
     },
-    [apiKeyMissing, clearAllTimeouts, tts],
+    [apiKeyMissing, tts],
   );
 
   const setBrand = useCallback(

@@ -223,7 +223,14 @@ export function createReturnTicketTool(
     reason: input.reason,
     resolution: input.resolution,
     exchangeSize: input.exchangeSize,
-    status: 'Initiated',
+    // Eligibility is already confirmed and a slot is already chosen by
+    // this point (both required arguments above) — those aren't future
+    // events, they're facts as of right now, so "Pickup Scheduled" is the
+    // accurate starting status. Nothing later (courier pickup, refund
+    // processing, exchange fulfillment) has actually happened yet, and
+    // this app has no real event to trigger those — see useReturnAgent.ts,
+    // which used to fake that progression on a timer and no longer does.
+    status: 'Pickup Scheduled',
     slot,
     itemPrice: match.item.price,
     refundAmount,
