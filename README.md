@@ -44,65 +44,120 @@ cp .env.example .env   # then add at least one provider's API key
 npm run dev
 ```
 
-**Three providers with automatic fallback**, not a manual switch — every
+**Five providers with automatic fallback**, not a manual switch — every
 request tries them in this fixed order, falling through to the next one
-only on a rate-limit/quota error:
+on a rate-limit/quota error *or* a network-level failure (fetch() itself
+unable to reach the provider):
 
 ```
 VITE_GROQ_API_KEY=your_key_here
 VITE_CEREBRAS_API_KEY=your_key_here
 VITE_OPENROUTER_API_KEY=your_key_here
+VITE_MISTRAL_API_KEY=your_key_here
+VITE_GEMINI_API_KEY=your_key_here
 ```
 
-All three are optional — any provider with no key set is skipped
+All five are optional — any provider with no key set is skipped
 entirely, so one key is enough to run the app. Configuring more than one
 is what makes fallback actually do something: if Groq's daily cap gets
 hit mid-conversation (a real thing that happened repeatedly during
 testing, and would just as easily kill a recruiter's live demo session),
 the very next request automatically retries on Cerebras, then OpenRouter,
-instead of surfacing an error. Once a provider rate-limits, later
-requests skip straight past it for the rest of the session (see
-`stickyProviderIndex` in `llmProvider.ts`) rather than re-trying a
-provider that's very likely still capped. Which provider served (or
-failed) each request is logged to the browser console
-(`[llmProvider] request served by …`), so fallback is visible while
-testing rather than invisible.
+then Mistral and Gemini, instead of surfacing an error. Once a
+provider rate-limits, later requests skip straight past it for the rest of
+the session (see `stickyProviderIndex` in `llmProvider.ts`) rather than
+re-trying a provider that's very likely still capped. Every attempt —
+success, retryable failure, or immediate failure — is logged to the
+browser console (`[llmProvider] request served by …`), so fallback is
+visible while testing rather than invisible.
 
-- **Groq** (tried first): free key at [console.groq.com/keys](https://console.groq.com/keys).
-- **Cerebras** (tried second): free key at [console.cerebras.ai](https://console.cerebras.ai).
-- **OpenRouter** (tried last): free key at [openrouter.ai/keys](https://openrouter.ai/keys).
+- **Groq** (tried 1st): free key at [console.groq.com/keys](https://console.groq.com/keys).
+- **Cerebras** (tried 2nd): free key at [console.cerebras.ai](https://console.cerebras.ai).
+- **OpenRouter** (tried 3rd): free key at [openrouter.ai/keys](https://openrouter.ai/keys).
+- **Mistral** (tried 4th): free key at [console.mistral.ai/api-keys](https://console.mistral.ai/api-keys).
+- **Gemini** (tried 5th, last): free key at [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey).
 
 If every configured provider's key is missing, the app shows a clear
 in-UI message instead of crashing (see `src/components/ApiKeyNotice.tsx`).
 No backend, no database — everything runs client-side with state held in
-React, calling each provider's `/chat/completions` API directly from the
-browser.
+React, calling each provider's chat API directly from the browser.
 
-**Which models, and why:** all three run the same OpenAI open-weight
+**Which models, and why:** the first three run the same OpenAI open-weight
 `gpt-oss` family, deliberately, not by coincidence. Tool calling is
 non-negotiable (most free-tier models don't support it at all), and
 having already validated this model family's tool-chaining behavior
 extensively against our system prompt (see below), keeping the weights
 in the same family when adding a provider means the main variable that
-changes is the hosting infrastructure — not the model's judgement.
+changes is the hosting infrastructure — not the model's judgement. The
+two added later each needed their own model chosen from that provider's
+own catalogue instead — and each was verified by actually running the
+full VS1002 return flow (order lookup → item pick → eligibility → reason
+→ resolution → slot pick → ticket creation) forced as the sole
+provider, not just checked for "does it respond."
 
-- **Groq** (`openai/gpt-oss-20b`, no backend suffix) — tried first. Added
+- **Groq** (`openai/gpt-oss-20b`, no backend suffix) — tried 1st. Added
   after OpenRouter's free tier hit its 50-request/day account-level cap
   mid-testing (a hard wall, not a per-minute throttle — it doesn't clear
   until the daily reset or a credit top-up). Groq's LPU inference is also
   substantially faster, which incidentally helps the separate latency
   work already done (see "Design decisions").
-- **Cerebras** (`gpt-oss-120b`) — tried second, added as a third provider
+- **Cerebras** (`gpt-oss-120b`) — tried 2nd, added as a third provider
   specifically for automatic fallback (see above). The larger 120b variant
   of the same gpt-oss family, not the smaller/preview-tier models Cerebras
   also hosts: those weren't confirmed in Cerebras's own docs to support
   tool calling, and `gpt-oss-120b` was — with worked tool-calling examples
   — while also being a production-tier model, not one flagged for
   near-term deprecation.
-- **OpenRouter** (`openai/gpt-oss-20b:free`) — tried last, the original
+- **OpenRouter** (`openai/gpt-oss-20b:free`) — tried 3rd, the original
   provider. Its free-tier daily cap is real (see above) but the model is
   well-validated there specifically: two full multi-scenario test passes
   with zero broken tool chains.
+- **Mistral** (`mistral-small-latest`) — tried 4th, added when Groq,
+  Cerebras, and OpenRouter all hit genuine *daily* exhaustion
+  simultaneously during testing (confirmed by spaced-out probe requests
+  still failing, ruling out a transient per-minute cap). Mistral's docs
+  list function calling as supported across its whole current
+  general-purpose lineup (Large/Medium/Small); Small was picked
+  specifically because it's the cheapest/fastest model in that
+  confirmed-supported set — this tier of the fallback chain only needs to
+  answer reliably, not reason deeply.
+- **Gemini** (`gemini-flash-latest`) — tried 4th and last (see the
+  SambaNova note below for why the chain is 5 providers, not 6), and the
+  only provider here that isn't OpenAI-compatible: different
+  request/response shape entirely (`contents`/`parts`,
+  `functionCall`/`functionResponse`, header-based key auth instead of a
+  Bearer token), handled by its own adapter in `llmProvider.ts` rather
+  than reusing the shared streaming/parsing path. Originally pinned to
+  `gemini-2.5-flash`, but live testing found Google now rejects generation
+  calls to that specific model for newer API keys ("This model ... is no
+  longer available to new users", a 404 not surfaced anywhere in the
+  model's own docs) even though it's still listed by `ListModels`.
+  `gemini-flash-latest` is Google's own always-current alias instead of a
+  pinned version, sidestepping that trap; it currently resolves to Gemini
+  3.6 Flash. Getting this adapter right also surfaced two real bugs only
+  a live multi-turn tool-calling run exposed: Gemini 3.x requires echoing
+  back an opaque `thoughtSignature` on every replayed function-call part
+  or it 400s ("Function call is missing a thought_signature"), and
+  `functionResponse.response` must be a JSON *object* — a tool that
+  returns a bare array (`getPickupSlots`) has to be wrapped
+  (`{ result: [...] }`) or Gemini's proto rejects it. Both are fixed in
+  `toGeminiContents`/`streamGeminiCompletionOnce`.
+
+**SambaNova Cloud was tried and dropped — not a model problem, an
+architectural one.** This slot was originally meant for GitHub Models,
+but GitHub Models was fully retired (2026-07-30, per GitHub's own docs —
+the playground, catalog, and inference API are gone for every customer)
+before this code shipped. SambaNova Cloud (`Meta-Llama-3.3-70B-Instruct`,
+picked because SambaNova's own function-calling docs say the smaller 8B
+model "cannot reliably maintain a conversation alongside tool-calling
+definitions") looked like a clean substitute on paper — but its REST API
+sends no `Access-Control-Allow-Origin` header at all, so every request
+from this app fails the CORS preflight before it ever reaches SambaNova
+(confirmed live: a direct browser-context `fetch()` to their
+`/chat/completions` throws `TypeError: Failed to fetch` with a CORS error
+in the console). This app is client-side-only with no backend to proxy
+through, so there's no fix short of adding one — no model choice changes
+a missing CORS header. Dropped rather than filled a third time.
 
 **We tested OpenRouter's paid variant (`openai/gpt-oss-20b`, no `:free`
 suffix) and deliberately did not switch to it.** Same weights, meaningfully
@@ -121,7 +176,7 @@ change, not just a speed change, even at identical model weights — worth
 a few test conversations before trusting a new provider in a live demo,
 which is exactly what we did before relying on Groq (see below).
 
-To add a fourth provider, reorder the fallback chain, or change a model
+To add another provider, reorder the fallback chain, or change a model
 string, everything is in `src/lib/llmProvider.ts` — nothing else in the
 app needs to change (see "Design decisions" below).
 
@@ -135,11 +190,13 @@ is sufficient — no `vercel.json` needed. Build command `npm run build`
 2. [vercel.com/new](https://vercel.com/new) → import the repo.
 3. **Add the env vars before the first build**: Project Settings →
    Environment Variables → any of `VITE_GROQ_API_KEY`,
-   `VITE_CEREBRAS_API_KEY`, `VITE_OPENROUTER_API_KEY` (all optional, at
-   least one required), checked for Production/Preview/Development. Vite
-   inlines `VITE_*` vars at *build* time, so having none set means the
-   deployed build falls back to the in-app "API key missing" screen, not a
-   crash — but keys have to be set before you build, not after.
+   `VITE_CEREBRAS_API_KEY`, `VITE_OPENROUTER_API_KEY`,
+   `VITE_MISTRAL_API_KEY`, `VITE_GEMINI_API_KEY`
+   (all optional, at least one required), checked for
+   Production/Preview/Development. Vite inlines `VITE_*` vars at *build*
+   time, so having none set means the deployed build falls back to the
+   in-app "API key missing" screen, not a crash — but keys have to be set
+   before you build, not after.
 4. Deploy. Every push to the connected branch redeploys automatically.
 
 The key ends up in the client-side JS bundle by design (no backend to hide
@@ -190,9 +247,9 @@ beyond a live call.
 ## What's real vs. mocked
 
 **Real:**
-- Function calling (Groq, Cerebras, or OpenRouter, all running the same
-  `gpt-oss` model family, with automatic fallback between them — see
-  Setup) drives the entire conversation on **both channels** — order
+- Function calling (Groq, Cerebras, OpenRouter, Mistral, or Gemini, with
+  automatic fallback between them — see Setup) drives the
+  entire conversation on **both channels** — order
   lookup, eligibility checks, size lookup, pickup slots, and ticket creation
   are actual tool calls the model makes, not scripted branching. Responses
   stream token-by-token, and the ops panel shows which tool is executing in
@@ -327,12 +384,14 @@ instruction.
 
 ## Stack
 
-Vite + React + TypeScript + Tailwind CSS v4, Groq/Cerebras/OpenRouter's
-OpenAI-compatible REST APIs (`gpt-oss` family, streamed via plain
-`fetch` — no SDK, with automatic rate-limit fallback across providers),
-the browser's native Web Speech API for the voice
-channel (no telephony/speech vendor, no SDK there either), no backend, no
-state management library — plain React state in `src/hooks/useReturnAgent.ts`.
+Vite + React + TypeScript + Tailwind CSS v4, five LLM providers behind one
+fallback chain (Groq/Cerebras/OpenRouter/Mistral's
+OpenAI-compatible REST APIs plus a Gemini-native adapter, all streamed via
+plain `fetch` — no SDK, with automatic fallback on rate-limit or network
+failure across providers), the browser's native Web Speech API for the
+voice channel (no telephony/speech vendor, no SDK there either), no
+backend, no state management library — plain React state in
+`src/hooks/useReturnAgent.ts`.
 
 ## Project structure
 
@@ -344,7 +403,7 @@ src/
   data/scenarios.ts        # scripted "Play scenario" openers, shared by both channels
   lib/policy.ts            # deterministic eligibility rules — unchanged by adding voice
   lib/tools.ts             # pure tool implementations, incl. the duplicate-booking guard, shared by both channels
-  lib/llmProvider.ts       # the ONLY file that knows the LLM vendor(s); streaming Groq/Cerebras/OpenRouter client, automatic rate-limit fallback + function-calling loop — unchanged by adding voice
+  lib/llmProvider.ts       # the ONLY file that knows the LLM vendor(s); streaming client for 5 providers (4 OpenAI-compatible + a Gemini adapter), automatic rate-limit/network fallback + function-calling loop — unchanged by adding voice
   lib/systemPrompt.ts      # WhatsApp channel's conversational script (not policy)
   lib/voiceSystemPrompt.ts # voice channel's conversational script — different formatting/brevity rules, same flow
   lib/formatText.ts        # chat sanitizer: renders the model's *bold* as actual bold (code enforces, not the prompt)

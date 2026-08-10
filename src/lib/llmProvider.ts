@@ -8,60 +8,120 @@ import { buildSystemInstruction } from './systemPrompt';
  * for the exports below — swapping vendors, or adding another one, means
  * rewriting this one file, not touching the hook, the tools, or the UI.
  *
- * Three providers, all OpenAI-compatible chat-completions APIs, tried
- * automatically in a fixed fallback order on a rate-limit/quota error —
- * see PROVIDER_ORDER and streamChatCompletion. Any provider with no API
- * key configured is skipped entirely (see getConfiguredProviders); this
- * only exists so a recruiter's live demo session doesn't die the moment
- * one free-tier daily cap is hit:
+ * Five providers, tried automatically in a fixed fallback order — see
+ * PROVIDER_ORDER and streamChatCompletion. Four are OpenAI-compatible
+ * chat-completions APIs sharing one request/parsing path
+ * (streamOpenAiCompletionOnce); Gemini's API shape is different enough
+ * (contents/parts instead of messages, functionCall/functionResponse
+ * instead of tool_calls, query-param-free header auth, no shared SSE delta
+ * format) that it gets its own adapter — see toGeminiContents and
+ * streamGeminiCompletionOnce — converting to/from the same ChatSession
+ * shape at the boundary so nothing above this file needs to know Gemini is
+ * different. Any provider with no API key configured is skipped entirely
+ * (see getConfiguredProviders); this only exists so a recruiter's live demo
+ * session doesn't die the moment one free-tier daily cap is hit. Fallback
+ * triggers on BOTH a rate-limit/quota response AND a network-level failure
+ * (fetch() itself throwing — CORS, DNS, connection refused) — see
+ * isRetryableProviderError — since either symptom means "this vendor isn't
+ * answering right now, try the next one." Anything else (bad request, auth
+ * failure, a genuine bug) surfaces immediately instead of being silently
+ * retried on a different vendor, so a real bug doesn't masquerade as
+ * flakiness.
  *
- * - Groq (`openai/gpt-oss-20b`) — tried first. The fastest of the three
+ * - Groq (`openai/gpt-oss-20b`) — tried first. The fastest of the five
  *   (LPU inference) and the most extensively validated against this app's
  *   system prompt.
  *
- * - Cerebras (`gpt-oss-120b`) — tried second. Same gpt-oss family as the
- *   other two (OpenAI's own open-weight models), just the larger 120b
- *   variant — Cerebras's smaller/preview-tier models weren't confirmed to
- *   support tool calling in their docs, and tool calling here is
- *   non-negotiable, so this was the one model in their production catalog
- *   both documented as supporting it (with worked tool-calling examples)
- *   and not flagged for near-term deprecation.
+ * - Cerebras (`gpt-oss-120b`) — tried second. Same gpt-oss family as Groq
+ *   (OpenAI's own open-weight models), just the larger 120b variant —
+ *   Cerebras's smaller/preview-tier models weren't confirmed to support
+ *   tool calling in their docs, and tool calling here is non-negotiable, so
+ *   this was the one model in their production catalog both documented as
+ *   supporting it (with worked tool-calling examples) and not flagged for
+ *   near-term deprecation.
  *
- * - OpenRouter (`openai/gpt-oss-20b:free`) — tried last. The original
- *   provider, kept as the final fallback. Picked originally because it's
- *   one of the few OpenRouter free-tier models whose `supported_parameters`
- *   list includes `tools`/`tool_choice` (most free models don't support
- *   function calling at all). The paid, no-`:free` variant is faster but is
- *   NOT used — see README "Design decisions": it's served by a different
- *   upstream provider and a 4-trial probe found it dropped mid-tool-chain 3
- *   times out of 4. Reliable tool chaining outranks speed here.
+ * - OpenRouter (`openai/gpt-oss-20b:free`) — tried third. The original
+ *   provider. Picked originally because it's one of the few OpenRouter
+ *   free-tier models whose `supported_parameters` list includes
+ *   `tools`/`tool_choice` (most free models don't support function calling
+ *   at all). The paid, no-`:free` variant is faster but is NOT used — see
+ *   README "Design decisions": it's served by a different upstream provider
+ *   and a 4-trial probe found it dropped mid-tool-chain 3 times out of 4.
+ *   Reliable tool chaining outranks speed here.
+ *
+ * - Mistral (`mistral-small-latest`) — tried fourth. Mistral's docs list
+ *   function calling as supported across its current general-purpose
+ *   lineup (Large/Medium/Small), so Small was picked specifically because
+ *   it's the cheapest/fastest model in that confirmed-supported set — this
+ *   fallback tier only needs "answers reliably", not frontier reasoning.
+ *
+ * - (SambaNova Cloud, `Meta-Llama-3.3-70B-Instruct`, was tried here — not
+ *   for a model-quality reason but an architectural one. It was meant to
+ *   fill the slot originally planned for GitHub Models, which turned out to
+ *   be fully retired (2026-07-30, per GitHub's own docs) before this code
+ *   was written. SambaNova's REST API sends no `Access-Control-Allow-Origin`
+ *   header at all, so every request from this app — a client-side-only SPA
+ *   with no backend to proxy through — fails the CORS preflight before it
+ *   even reaches SambaNova; confirmed live, not a guess (a direct
+ *   browser-context `fetch()` to their `/chat/completions` throws
+ *   `TypeError: Failed to fetch` with a CORS error logged to the console).
+ *   No model choice fixes a missing CORS header, so this slot was dropped
+ *   rather than filled a third time.)
+ *
+ * - Gemini (`gemini-flash-latest`) — tried last. Originally pinned to
+ *   `gemini-2.5-flash` as the longer-established GA model, but live testing
+ *   found Google now rejects generation calls to it for newer API keys
+ *   ("This model ... is no longer available to new users", 404) even
+ *   though it's still listed by ListModels — a account-tier restriction,
+ *   not a deprecation the docs surface anywhere. `gemini-flash-latest` is
+ *   Google's own always-current alias instead of a pinned version, which
+ *   sidesteps exactly this trap; confirmed live (both plain replies and
+ *   tool calls) against the account this app actually uses, currently
+ *   resolving to Gemini 3.6 Flash. Not OpenAI-compatible — see the adapter
+ *   note above.
  */
 
-type LlmProviderName = 'groq' | 'cerebras' | 'openrouter';
+type LlmProviderName = 'groq' | 'cerebras' | 'openrouter' | 'mistral' | 'gemini';
 
 /** Fixed fallback order — not user-configurable (there's no more
  * VITE_LLM_PROVIDER switch; every configured provider is tried
  * automatically, in this order, per request). */
-const PROVIDER_ORDER: LlmProviderName[] = ['groq', 'cerebras', 'openrouter'];
+const PROVIDER_ORDER: LlmProviderName[] = ['groq', 'cerebras', 'openrouter', 'mistral', 'gemini'];
 
-interface ProviderSpec {
+interface OpenAiProviderSpec {
+  kind: 'openai';
   name: LlmProviderName;
   url: string;
   model: string;
   apiKey: string | undefined;
   headers: Record<string, string>;
-  /** Same idea on all three providers — trade reasoning depth for latency,
-   * since this agent only needs to pick the right tool and phrase a short
-   * reply — but they spell it differently: OpenRouter wants a nested
-   * `reasoning` object; Groq and Cerebras (both following OpenAI's own
-   * gpt-oss param naming directly) want a flat `reasoning_effort` string. */
+  /** Same idea on every OpenAI-compatible provider here — trade reasoning
+   * depth for latency, since this agent only needs to pick the right tool
+   * and phrase a short reply — but not all of them spell it the same way:
+   * OpenRouter wants a nested `reasoning` object; Groq and Cerebras (both
+   * following OpenAI's own gpt-oss param naming directly) want a flat
+   * `reasoning_effort` string; Mistral's model here has no equivalent knob,
+   * so this is just empty for it. */
   reasoningParam: Record<string, unknown>;
 }
 
-function buildProviderSpec(name: LlmProviderName): ProviderSpec {
+/** Gemini has no OpenAI-shaped `messages`/`tool_calls`/Bearer-header
+ * concept — see toGeminiContents and streamGeminiCompletionOnce — so its
+ * spec carries only what that adapter actually needs. */
+interface GeminiProviderSpec {
+  kind: 'gemini';
+  name: 'gemini';
+  model: string;
+  apiKey: string | undefined;
+}
+
+type AnyProviderSpec = OpenAiProviderSpec | GeminiProviderSpec;
+
+function buildProviderSpec(name: LlmProviderName): AnyProviderSpec {
   if (name === 'cerebras') {
     const key = import.meta.env.VITE_CEREBRAS_API_KEY;
     return {
+      kind: 'openai',
       name,
       url: 'https://api.cerebras.ai/v1/chat/completions',
       model: 'gpt-oss-120b',
@@ -76,6 +136,7 @@ function buildProviderSpec(name: LlmProviderName): ProviderSpec {
   if (name === 'openrouter') {
     const key = import.meta.env.VITE_OPENROUTER_API_KEY;
     return {
+      kind: 'openai',
       name,
       url: 'https://openrouter.ai/api/v1/chat/completions',
       model: 'openai/gpt-oss-20b:free',
@@ -88,8 +149,32 @@ function buildProviderSpec(name: LlmProviderName): ProviderSpec {
       reasoningParam: { reasoning: { effort: 'low' } },
     };
   }
+  if (name === 'mistral') {
+    const key = import.meta.env.VITE_MISTRAL_API_KEY;
+    return {
+      kind: 'openai',
+      name,
+      url: 'https://api.mistral.ai/v1/chat/completions',
+      model: 'mistral-small-latest',
+      apiKey: key,
+      headers: {
+        Authorization: `Bearer ${key ?? ''}`,
+        'Content-Type': 'application/json',
+      },
+      reasoningParam: {},
+    };
+  }
+  if (name === 'gemini') {
+    return {
+      kind: 'gemini',
+      name: 'gemini',
+      model: 'gemini-flash-latest',
+      apiKey: import.meta.env.VITE_GEMINI_API_KEY,
+    };
+  }
   const key = import.meta.env.VITE_GROQ_API_KEY;
   return {
+    kind: 'openai',
     name,
     url: 'https://api.groq.com/openai/v1/chat/completions',
     model: 'openai/gpt-oss-20b',
@@ -104,7 +189,7 @@ function buildProviderSpec(name: LlmProviderName): ProviderSpec {
 
 /** Providers with a configured, non-empty API key, in fallback order.
  * Empty means no provider is usable at all — see hasApiKey/ApiKeyNotice. */
-function getConfiguredProviders(): ProviderSpec[] {
+function getConfiguredProviders(): AnyProviderSpec[] {
   return PROVIDER_ORDER.map(buildProviderSpec).filter((p) => Boolean(p.apiKey && p.apiKey.trim().length > 0));
 }
 
@@ -139,6 +224,16 @@ const PROVIDER_DISPLAY: Record<LlmProviderName, ProviderDisplayInfo> = {
     name: 'OpenRouter',
     keyUrl: 'https://openrouter.ai/keys',
     envVarName: 'VITE_OPENROUTER_API_KEY',
+  },
+  mistral: {
+    name: 'Mistral',
+    keyUrl: 'https://console.mistral.ai/api-keys',
+    envVarName: 'VITE_MISTRAL_API_KEY',
+  },
+  gemini: {
+    name: 'Gemini',
+    keyUrl: 'https://aistudio.google.com/app/apikey',
+    envVarName: 'VITE_GEMINI_API_KEY',
   },
 };
 
@@ -176,9 +271,11 @@ function logProviderConfigAtStartup(): void {
 }
 logProviderConfigAtStartup();
 
-// --- OpenAI-style tool declarations (all three providers' chat completions
-// APIs are OpenAI-compatible, so tools are described the same way
-// regardless of which one answers). ---
+// --- OpenAI-style tool declarations. Five of the six providers' chat
+// completions APIs are OpenAI-compatible, so tools are described the same
+// way regardless of which one answers; Gemini reshapes this same catalogue
+// into its own FunctionDeclaration format at the adapter boundary instead
+// of duplicating it — see geminiFunctionDeclarations below. ---
 
 interface JsonSchema {
   type: string;
@@ -354,6 +451,12 @@ interface ToolCall {
   id: string;
   type: 'function';
   function: { name: string; arguments: string };
+  /** Gemini 3.x-only: an opaque blob Gemini attaches to every functionCall
+   * part and then requires verbatim on that same call when it's replayed in
+   * a later request's history (a 400 otherwise — "Function call is missing
+   * a thought_signature in functionCall parts"). No other provider's calls
+   * ever set this; see streamGeminiCompletionOnce and toGeminiContents. */
+  geminiThoughtSignature?: string;
 }
 
 interface ChatCompletionMessage {
@@ -428,14 +531,28 @@ function buildRequestMessages(fullHistory: ChatCompletionMessage[], contextSumma
 }
 
 /** Matches the same rate-limit/quota wording useReturnAgent.ts's own
- * isQuotaError checks for — this is the ONLY error class that triggers
- * automatic provider fallback (see streamChatCompletion). Anything else
- * (bad request, auth failure, network error) surfaces immediately instead
- * of being silently retried on a different vendor, so a real bug doesn't
- * masquerade as "it just worked eventually." */
+ * isQuotaError check looks for. One of two conditions that trigger
+ * automatic provider fallback — see isRetryableProviderError, which also
+ * covers network-level failures. */
 function isRateLimitOrQuotaError(message: string): boolean {
   const lower = message.toLowerCase();
   return message.includes('429') || lower.includes('quota') || lower.includes('rate limit');
+}
+
+/** The ONLY two failure classes that trigger automatic provider fallback
+ * (see streamChatCompletion): an explicit rate-limit/quota response, or a
+ * network-level failure where fetch() never got a response at all (CORS
+ * block, DNS failure, connection refused, offline) — browsers reject
+ * fetch()'s own promise with a TypeError for that case specifically,
+ * distinct from the plain Error this module throws itself for a real HTTP
+ * error status or a malformed response. Anything else (bad request, auth
+ * failure, a genuine bug in the request body) surfaces immediately instead
+ * of being silently retried on a different vendor, so a real bug doesn't
+ * masquerade as "it just worked eventually." */
+function isRetryableProviderError(err: unknown): boolean {
+  if (err instanceof TypeError) return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return isRateLimitOrQuotaError(message);
 }
 
 /** Index into getConfiguredProviders() to try first. Starts at 0 (highest-
@@ -447,18 +564,19 @@ function isRateLimitOrQuotaError(message: string): boolean {
 let stickyProviderIndex = 0;
 
 /**
- * Streams one chat completion from one specific provider, invoking
- * `onTextDelta` with the accumulated visible text as tokens arrive (never
- * with reasoning tokens — those are dropped so the model's internal
+ * Streams one chat completion from one specific OpenAI-compatible provider,
+ * invoking `onTextDelta` with the accumulated visible text as tokens arrive
+ * (never with reasoning tokens — those are dropped so the model's internal
  * chain-of-thought never leaks into the chat). Tool-call argument
  * fragments are accumulated by index per OpenAI's streaming tool-call
  * format and returned whole at the end, since a tool can only be executed
  * once its full arguments are known. The SSE format itself is identical
- * across all three providers (all OpenAI-compatible), so only request
- * construction is provider-specific.
+ * across every provider here (all OpenAI-compatible), so only request
+ * construction is provider-specific. Gemini does not go through this path
+ * at all — see streamGeminiCompletionOnce below.
  */
-async function streamChatCompletionOnce(
-  spec: ProviderSpec,
+async function streamOpenAiCompletionOnce(
+  spec: OpenAiProviderSpec,
   messages: ChatCompletionMessage[],
   onTextDelta?: (textSoFar: string) => void,
 ): Promise<StreamResult> {
@@ -536,17 +654,211 @@ async function streamChatCompletionOnce(
   return { content, toolCalls };
 }
 
+// --- Gemini adapter. Different message shape (contents/parts, not
+// messages), different tool-call shape (functionCall/functionResponse, not
+// tool_calls), different auth (a header, no Bearer scheme), different
+// streaming envelope — converts to/from the same ChatCompletionMessage /
+// StreamResult shapes everything else in this file uses, so the rest of
+// the module (and everything above it) never has to know Gemini is
+// different. ---
+
+interface GeminiPart {
+  text?: string;
+  functionCall?: { name: string; args: Record<string, unknown> };
+  functionResponse?: { name: string; response: Record<string, unknown> };
+  /** Sibling of `functionCall` on the same part, not nested inside it —
+   * see the `geminiThoughtSignature` field on ToolCall for why this exists. */
+  thoughtSignature?: string;
+}
+
+interface GeminiContent {
+  role: 'user' | 'model';
+  parts: GeminiPart[];
+}
+
+/** Gemini has no `tool_call_id` concept — a functionResponse part is
+ * matched to its call by function name, not an id — so this walks the
+ * OpenAI-shaped history once to recover which function name each `tool`
+ * message's `tool_call_id` belongs to (set by the preceding assistant
+ * message's tool_calls, which always comes first in the array). */
+function toGeminiContents(messages: ChatCompletionMessage[]): {
+  systemInstruction?: { parts: { text: string }[] };
+  contents: GeminiContent[];
+} {
+  const systemTexts: string[] = [];
+  const contents: GeminiContent[] = [];
+  const nameByToolCallId = new Map<string, string>();
+
+  for (const msg of messages) {
+    if (msg.role === 'system') {
+      if (msg.content) systemTexts.push(msg.content);
+    } else if (msg.role === 'user') {
+      contents.push({ role: 'user', parts: [{ text: msg.content ?? '' }] });
+    } else if (msg.role === 'assistant') {
+      const parts: GeminiPart[] = [];
+      if (msg.content) parts.push({ text: msg.content });
+      for (const tc of msg.tool_calls ?? []) {
+        nameByToolCallId.set(tc.id, tc.function.name);
+        let args: Record<string, unknown> = {};
+        try {
+          args = JSON.parse(tc.function.arguments || '{}');
+        } catch {
+          // malformed args from the model — send empty, same as the
+          // OpenAI-compatible executor path does on a parse failure.
+        }
+        parts.push({
+          functionCall: { name: tc.function.name, args },
+          ...(tc.geminiThoughtSignature ? { thoughtSignature: tc.geminiThoughtSignature } : {}),
+        });
+      }
+      contents.push({ role: 'model', parts });
+    } else if (msg.role === 'tool') {
+      const name = nameByToolCallId.get(msg.tool_call_id ?? '') ?? 'unknown_function';
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(msg.content ?? '{}');
+      } catch {
+        parsed = { result: msg.content };
+      }
+      // Gemini's functionResponse.response must be a JSON *object* (a proto
+      // Struct) — a tool that returns a bare array (e.g. getPickupSlots)
+      // fails typeof-object here too (typeof [] === 'object' in JS), so
+      // arrays need the same { result: ... } wrapping as a primitive.
+      const response =
+        parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? (parsed as Record<string, unknown>)
+          : { result: parsed };
+      contents.push({ role: 'user', parts: [{ functionResponse: { name, response } }] });
+    }
+  }
+
+  return {
+    systemInstruction: systemTexts.length > 0 ? { parts: [{ text: systemTexts.join('\n\n') }] } : undefined,
+    contents,
+  };
+}
+
+/** Same tool catalogue as every other provider (see toolDeclarations),
+ * reshaped into Gemini's flatter FunctionDeclaration — no `type: 'function'`
+ * wrapper, no nested `function` object. The JSON-schema `parameters` object
+ * itself (type/properties/required/enum, all lowercase) is accepted as-is —
+ * Gemini's Schema type uses the same lowercase JSON-schema-style values. */
+const geminiFunctionDeclarations = toolDeclarations.map((t) => ({
+  name: t.function.name,
+  description: t.function.description,
+  parameters: t.function.parameters,
+}));
+
+/**
+ * Streams one chat completion from Gemini. Unlike the OpenAI-compatible
+ * path, a function call arrives whole in a single streamed part rather than
+ * as incremental argument-string deltas, so no by-index accumulation is
+ * needed — each `functionCall` part is a complete call. No `thinkingConfig`
+ * override here (unlike the `reasoningParam` every OpenAI-compatible spec
+ * sets to trade reasoning depth for latency): `gemini-flash-latest`
+ * currently resolves to a Gemini 3.x model, and those reject
+ * `thinkingBudget: 0` outright (`400 INVALID_ARGUMENT`) — 3.x requires its
+ * internal thinking pass to stay on, including for function calling.
+ */
+async function streamGeminiCompletionOnce(
+  spec: GeminiProviderSpec,
+  messages: ChatCompletionMessage[],
+  onTextDelta?: (textSoFar: string) => void,
+): Promise<StreamResult> {
+  const { systemInstruction, contents } = toGeminiContents(messages);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${spec.model}:streamGenerateContent?alt=sse`;
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'x-goog-api-key': spec.apiKey ?? '',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      contents,
+      ...(systemInstruction ? { systemInstruction } : {}),
+      tools: [{ functionDeclarations: geminiFunctionDeclarations }],
+    }),
+  });
+
+  if (!res.ok || !res.body) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`gemini request failed: ${res.status} ${res.statusText} ${body}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let content = '';
+  const toolCalls: ToolCall[] = [];
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue; // skip SSE comments/keepalives
+      const data = trimmed.slice(5).trim();
+      if (!data) continue;
+
+      let chunk: { candidates?: { content?: { parts?: GeminiPart[] } }[] };
+      try {
+        chunk = JSON.parse(data);
+      } catch {
+        continue;
+      }
+      const parts = chunk?.candidates?.[0]?.content?.parts ?? [];
+      for (const part of parts) {
+        if (typeof part.text === 'string' && part.text.length > 0) {
+          content += part.text;
+          onTextDelta?.(content);
+        }
+        if (part.functionCall) {
+          toolCalls.push({
+            id: crypto.randomUUID(),
+            type: 'function',
+            function: {
+              name: part.functionCall.name,
+              arguments: JSON.stringify(part.functionCall.args ?? {}),
+            },
+            geminiThoughtSignature: part.thoughtSignature,
+          });
+        }
+      }
+    }
+  }
+
+  return { content, toolCalls };
+}
+
+/** Dispatches to the right adapter based on spec.kind — the only place in
+ * this file that needs to know both adapters exist. */
+async function streamProviderOnce(
+  spec: AnyProviderSpec,
+  messages: ChatCompletionMessage[],
+  onTextDelta?: (textSoFar: string) => void,
+): Promise<StreamResult> {
+  return spec.kind === 'gemini'
+    ? streamGeminiCompletionOnce(spec, messages, onTextDelta)
+    : streamOpenAiCompletionOnce(spec, messages, onTextDelta);
+}
+
 /**
  * Tries each configured provider in fallback order, starting from
- * `stickyProviderIndex`, advancing to the next only on a rate-limit/quota
- * error — including the "empty completion" symptom of one, checked here so
- * it participates in fallback too (see the comment below). Any other error
- * type surfaces immediately without trying further providers. Logs which
- * provider served (or failed) each request to the console, so fallback
- * behavior is visible while testing. Only once every configured provider
- * has failed does this throw — and that final error still carries "rate
- * limit" wording, so the hook's existing isQuotaError check renders the
- * same friendly message it always has.
+ * `stickyProviderIndex`, advancing to the next on either a rate-limit/quota
+ * error OR a network-level failure — including the "empty completion"
+ * symptom of a rate limit, checked here so it participates in fallback too
+ * (see the comment below) — see isRetryableProviderError. Any other error
+ * type surfaces immediately without trying further providers. Logs every
+ * attempt to the console (success, retryable failure, or immediate
+ * failure), so fallback behavior is visible while testing. Only once every
+ * configured provider has failed does this throw — and that final error
+ * still carries "rate limit" wording, so the hook's existing isQuotaError
+ * check renders the same friendly message it always has.
  */
 async function streamChatCompletion(
   messages: ChatCompletionMessage[],
@@ -562,7 +874,7 @@ async function streamChatCompletion(
   for (let i = stickyProviderIndex; i < providers.length; i += 1) {
     const spec = providers[i];
     try {
-      const result = await streamChatCompletionOnce(spec, messages, onTextDelta);
+      const result = await streamProviderOnce(spec, messages, onTextDelta);
 
       // A completion with no tool calls AND no text is not a valid reply —
       // seen in practice as a stream that returns 200 and a normal-looking
@@ -581,10 +893,14 @@ async function streamChatCompletion(
     } catch (err) {
       lastError = err;
       const message = err instanceof Error ? err.message : String(err);
-      if (!isRateLimitOrQuotaError(message)) throw err;
+      if (!isRetryableProviderError(err)) {
+        console.error(`[llmProvider] ${spec.name} failed with a non-retryable error — not falling back:`, message);
+        throw err;
+      }
       const next = providers[i + 1];
+      const reason = err instanceof TypeError ? 'unreachable (network error)' : 'rate-limited/quota exceeded';
       console.warn(
-        `[llmProvider] ${spec.name} rate-limited/quota exceeded${next ? `, falling back to ${next.name}…` : ' — no more providers configured.'}`,
+        `[llmProvider] ${spec.name} ${reason}${next ? `, falling back to ${next.name}…` : ' — no more providers configured.'}`,
         message,
       );
       stickyProviderIndex = i + 1;
