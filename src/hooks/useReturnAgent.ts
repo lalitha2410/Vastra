@@ -328,7 +328,23 @@ function updateFacts(facts: ConversationFacts, name: string, args: Record<string
       }
       break;
     case 'getAvailableSizes':
-      if (r?.found) facts.availableSizes = r.availableSizes as string[] | undefined;
+      if (r?.found) {
+        facts.availableSizes = r.availableSizes as string[] | undefined;
+        // The system prompt only ever calls this tool when reason is
+        // "size" (see systemPrompt.ts step 4) — so the call itself is
+        // authoritative evidence of the reason, independent of whether
+        // the customer ever answered an explicit numbered "why" question.
+        // Needed because a scripted opener can already state the reason
+        // in prose ("the kurta runs tight, can I exchange it"), letting
+        // the model skip straight to offering sizes in the very first
+        // turn. Without this, the 'reason' step still reads as pending,
+        // so the customer's NEXT reply — their actual size choice — gets
+        // mis-captured as if it were answering "why", and since that text
+        // isn't literally "size", the deterministic resolution rule wrongly
+        // concludes 'refund' on what's clearly an exchange. Guarded so it
+        // never overwrites a reason genuinely captured some other way.
+        if (!facts.reason) facts.reason = 'size';
+      }
       break;
     case 'getPickupSlots':
       if (Array.isArray(result)) {

@@ -4,8 +4,16 @@ import { StatusPipelineCompact } from './StatusPipeline';
 
 const rupee = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
 
-// Shared column widths so the header and every row line up exactly.
-const GRID_COLS = 'grid-cols-[104px_112px_minmax(160px,1fr)_112px_188px_150px_128px]';
+// Shared column widths so the header and every row line up exactly. The
+// demo "Advance" control deliberately has NO column of its own — it's an
+// absolutely-positioned overlay revealed on row hover (see TicketCard),
+// so it never takes width away from the actual ticket data, and doesn't
+// leave a dead placeholder once a ticket has nothing left to advance to.
+// Pickup/Amount is 190px, not the 150px it was originally — measured the
+// longest realistic pickup-slot label ("Wednesday, 12 Aug, 12 PM – 3 PM")
+// at 177px and it was genuinely truncating at 150px, independent of the
+// demo control's width (this predates it).
+const GRID_COLS = 'grid-cols-[104px_112px_minmax(160px,1fr)_112px_188px_190px]';
 
 export function TicketTableHeader() {
   return (
@@ -18,7 +26,6 @@ export function TicketTableHeader() {
       <span>Resolution</span>
       <span>Status</span>
       <span className="text-right">Pickup / Amount</span>
-      <span className="text-right">Demo</span>
     </div>
   );
 }
@@ -50,7 +57,7 @@ export function TicketCard({
     <div
       data-testid="ticket-card"
       data-status={ticket.status}
-      className={`wa-bubble-in grid ${GRID_COLS} items-center gap-3 border-b border-[#eef0f2] bg-white px-3 py-2 text-[12px] last:border-b-0 hover:bg-[#fafafa]`}
+      className={`wa-bubble-in group relative grid ${GRID_COLS} items-center gap-3 border-b border-[#eef0f2] bg-white px-3 py-2 text-[12px] last:border-b-0 hover:bg-[#fafafa]`}
     >
       <div className="min-w-0">
         <p className="truncate text-[12.5px] font-semibold text-[#111827]">{ticket.ticketId}</p>
@@ -89,21 +96,19 @@ export function TicketCard({
         )}
       </div>
 
-      <div className="text-right">
-        {nextStatus ? (
-          <button
-            type="button"
-            onClick={() => onAdvance(ticket.ticketId)}
-            title={`Demo control — this app has no real courier or bank integration to react to, so nothing advances the pipeline on its own. Click to simulate "${nextStatus}" for a live presentation; this is not part of the customer-facing product.`}
-            className="w-full rounded border border-dashed border-[#c9a13b] bg-[#fdf6e3] px-1.5 py-1 text-right text-[10px] font-semibold leading-tight text-[#92720f] transition-colors hover:bg-[#faedc4]"
-          >
-            ▸ Advance <span className="font-normal">(demo)</span>
-            <span className="block truncate text-[9.5px] font-normal text-[#a3841f]">to {nextStatus}</span>
-          </button>
-        ) : (
-          <span className="text-[10px] text-[#9ca3af]">—</span>
-        )}
-      </div>
+      {/* Icon-only, revealed on row hover/focus only — takes no grid
+          column, so it never costs the real ticket data any width, and
+          renders nothing at all once a ticket has no next status. */}
+      {nextStatus && (
+        <button
+          type="button"
+          onClick={() => onAdvance(ticket.ticketId)}
+          title={`Demo control — this app has no real courier or bank integration to react to, so nothing advances the pipeline on its own. Click to simulate "${nextStatus}" for a live presentation; this is not part of the customer-facing product.`}
+          className="absolute right-1.5 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-full border border-dashed border-[#c9a13b] bg-[#fdf6e3] text-[11px] font-bold leading-none text-[#92720f] opacity-0 shadow-sm transition-opacity duration-150 hover:bg-[#faedc4] focus-visible:opacity-100 group-hover:opacity-100"
+        >
+          ▸
+        </button>
+      )}
     </div>
   );
 }
