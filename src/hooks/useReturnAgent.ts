@@ -466,8 +466,20 @@ export function useReturnAgent() {
   // booking guard, not whatever was in scope when this closure was built —
   // a plain `tickets` dependency would also mean a new executor map (and a
   // new sendAgentMessage identity) on every ticket update mid-conversation.
+  // `facts` is a live reference (see chatFactsRef/voiceFactsRef below), not
+  // a snapshot — createReturnTicket reads it at call time, which matters
+  // because a single assistant turn can chain multiple tool calls back to
+  // back with no customer reply in between (e.g. getPickupSlots then
+  // immediately createReturnTicket, seen live on VS1002: the model
+  // presented slots and booked the first one in the same breath, without
+  // ever waiting for the customer to actually choose). `pendingCapture`
+  // only clears when captureNextReply processes a genuine NEW customer
+  // message, so if it's still set at the moment createReturnTicket runs,
+  // that question was never actually answered — refuse, same principle as
+  // the eligibility/duplicate-booking guards already enforced in code
+  // rather than left to the prompt.
   const buildExecutors = useCallback(
-    (currentBrand: BrandConfig): ToolExecutorMap => ({
+    (currentBrand: BrandConfig, facts: ConversationFacts): ToolExecutorMap => ({
       lookupOrder: (args) => lookupOrder(currentBrand.catalog, String(args.orderIdOrPhone ?? '')),
       checkReturnEligibility: (args) =>
         checkReturnEligibilityTool(currentBrand.catalog, String(args.orderId ?? ''), String(args.itemId ?? '')),
@@ -475,6 +487,12 @@ export function useReturnAgent() {
         getAvailableSizesTool(currentBrand.catalog, String(args.orderId ?? ''), String(args.itemId ?? '')),
       getPickupSlots: () => getPickupSlotsTool(),
       createReturnTicket: (args) => {
+        if (facts.pendingCapture) {
+          return {
+            success: false,
+            error: `The customer has not actually answered yet — you still need their reply for ${PENDING_CAPTURE_LABEL[facts.pendingCapture]} before creating a ticket. Present it (if you haven't) and wait for their next message; do not call createReturnTicket until they respond.`,
+          };
+        }
         const input = args as unknown as CreateReturnTicketInput;
         const result = createReturnTicketTool(
           currentBrand.catalog,
@@ -559,13 +577,15 @@ export function useReturnAgent() {
       setChatStreamingText('');
       captureNextReply(chatFactsRef.current, trimmed);
       try {
-        const executors = buildExecutors(brandRef.current);
+        const executors = buildExecutors(brandRef.current, chatFactsRef.current);
         const reply = await sendAgentMessage(
           chatSessionRef.current,
           trimmed,
           executors,
           (name, args, result) => {
             setChatToolActivity(TOOL_ACTIVITY_LABELS[name] ?? name);
+            // eslint-disable-next-line no-console
+            console.log(`[useReturnAgent] tool call (chat): ${name}`, args, '->', result);
             updateFacts(chatFactsRef.current, name, args, result);
           },
           (textSoFar) => setChatStreamingText(textSoFar),
@@ -705,13 +725,15 @@ export function useReturnAgent() {
       setVoiceStreamingText('');
       captureNextReply(voiceFactsRef.current, trimmed);
       try {
-        const executors = buildExecutors(brandRef.current);
+        const executors = buildExecutors(brandRef.current, voiceFactsRef.current);
         const reply = await sendAgentMessage(
           voiceSessionRef.current,
           trimmed,
           executors,
           (name, args, result) => {
             setVoiceToolActivity(TOOL_ACTIVITY_LABELS[name] ?? name);
+            // eslint-disable-next-line no-console
+            console.log(`[useReturnAgent] tool call (voice): ${name}`, args, '->', result);
             updateFacts(voiceFactsRef.current, name, args, result);
           },
           (textSoFar) => setVoiceStreamingText(textSoFar),
