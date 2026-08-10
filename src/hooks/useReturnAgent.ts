@@ -96,32 +96,15 @@ function isQuotaError(raw: string): boolean {
  * "order ID" or "reason" mean, so the facts worth remembering, and how to
  * extract them, live here instead.
  *
- * Every fact the conversation can establish, and where it comes from:
- *   - orderId, itemId, itemName, paymentMethod  <- lookupOrder (once
- *     unambiguous) and/or checkReturnEligibility
- *   - eligible, ineligibleReason                <- checkReturnEligibility
- *   - reason                                    <- see PENDING CAPTURE below
- *   - availableSizes                            <- getAvailableSizes
- *   - resolution, exchangeSize                  <- see PENDING CAPTURE below
- *   - pickupSlots (offered), pickupLabel (chosen) <- getPickupSlots /
- *     see PENDING CAPTURE below
- *   - ticketId                                  <- createReturnTicket
- *
- * PENDING CAPTURE: `reason`, `exchangeSize`, and the chosen pickup slot are
- * the facts no tool receives as an argument until createReturnTicket is
- * finally called — none of the earlier tools take them, so they can't be
- * read off a tool result the way everything else here can. Each is instead
- * captured positionally via `pendingCapture`: the system prompt's own flow
- * always asks for exactly one of these immediately after the tool call
- * that makes the question obvious (eligibility resolving -> ask reason;
- * sizes fetched -> ask which size; slots fetched -> ask which slot), so
- * the customer's next message is captured as the answer to whichever
- * question is currently pending. Tied to a structured event (a tool call
- * resolving), not pattern-matching on text content — see
- * captureNextReply's own comment for the one narrow exception (mapping a
- * bare "2" back to the numbered list the model itself presented).
- * `createReturnTicket`'s handler below is the final backstop for all
- * three: whatever actually got booked overwrites whatever was guessed.
+ * FLOW below is the explicit state machine this whole file is built
+ * around, added after the same bug recurred three times — order/item,
+ * then reason, then pickup slot — each fix adding its own one-off "is
+ * this already known" guard to a single tool's handler, and each new
+ * field forgetting the lesson the last one taught. `facts` is the single
+ * source of truth; nothing else independently tracks "what's already
+ * happened" or "what's still open" — it's always computed from `facts` by
+ * currentPendingQuestion and stepStatus, never stored separately, so nine
+ * different call sites can never drift out of sync with each other again.
  */
 interface ConversationFacts {
   orderId?: string;
@@ -137,23 +120,108 @@ interface ConversationFacts {
   pickupSlots?: { slotId: string; label: string }[];
   pickupLabel?: string;
   ticketId?: string;
-  /** The candidate list a pending 'item' capture resolves against — see
-   * pendingCapture below. Set alongside pendingCapture='item', cleared
-   * once it resolves (or the order turns out to have just one item). */
+  /** The candidate list a pending 'item' question resolves against — see
+   * currentPendingQuestion. Harmless to leave populated once itemId is
+   * set (nothing reads it once the 'item' question stops being pending). */
   pendingItemOptions?: { itemId: string; name: string }[];
   /** Only true once sendBankDetailsLink actually ran (see tools.ts) —
    * this is what lets the summary tell the model "already sent, don't
    * send or claim to send again" instead of the model being the only
    * record of whether that happened. */
   bankDetailsLinkSent?: boolean;
-  /** What the customer's NEXT message should be interpreted as, if
-   * nothing else claims it first. Armed by whichever tool call just made
-   * the follow-up question obvious; consumed (and cleared) by
-   * captureNextReply. At most one fact is ever "pending" at a time —
-   * later tool calls in the same turn simply overwrite an earlier one,
-   * which matches the flow: the model doesn't ask two different
-   * open questions in a row. */
-  pendingCapture?: 'item' | 'reason' | 'exchangeSize' | 'slot';
+}
+
+type PendingQuestion = 'item' | 'reason' | 'exchangeSize' | 'slot';
+
+/**
+ * The ordered steps of a return, in the order the system prompt walks
+ * through them. Each step's `done` is a pure function of `facts` — the
+ * ONLY place that decides whether a step is complete. `tools` is used
+ * solely for the redundant-call diagnostic below (requirement: fail
+ * loudly if the agent re-does a step it already finished), not for
+ * control flow.
+ */
+interface FlowStep {
+  id: 'order' | 'eligibility' | 'reason' | 'exchangeSize' | 'slot' | 'ticket' | 'bankLink';
+  label: string;
+  applies: (f: ConversationFacts) => boolean;
+  done: (f: ConversationFacts) => boolean;
+  tools: string[];
+}
+
+const FLOW: FlowStep[] = [
+  {
+    id: 'order',
+    label: 'order and item identified',
+    applies: () => true,
+    done: (f) => Boolean(f.orderId && f.itemId),
+    tools: ['lookupOrder'],
+  },
+  {
+    id: 'eligibility',
+    label: 'eligibility checked',
+    applies: (f) => Boolean(f.orderId && f.itemId),
+    done: (f) => f.eligible !== undefined,
+    tools: ['checkReturnEligibility'],
+  },
+  {
+    id: 'reason',
+    label: 'return reason captured',
+    applies: (f) => f.eligible === true,
+    done: (f) => Boolean(f.reason),
+    tools: [], // captured positionally (see currentPendingQuestion) — no tool takes it as an argument
+  },
+  {
+    id: 'exchangeSize',
+    label: 'exchange size chosen',
+    applies: (f) => f.reason === 'size' && f.resolution !== 'refund',
+    done: (f) => Boolean(f.exchangeSize) || f.resolution === 'refund',
+    tools: ['getAvailableSizes'],
+  },
+  {
+    id: 'slot',
+    label: 'pickup slot chosen',
+    applies: (f) => f.eligible === true && Boolean(f.reason),
+    done: (f) => Boolean(f.pickupLabel),
+    tools: ['getPickupSlots'],
+  },
+  {
+    id: 'ticket',
+    label: 'return ticket created',
+    applies: (f) => f.eligible === true,
+    done: (f) => Boolean(f.ticketId),
+    tools: ['createReturnTicket'],
+  },
+  {
+    id: 'bankLink',
+    label: 'bank details link sent',
+    applies: (f) => Boolean(f.ticketId) && f.paymentMethod === 'COD' && f.resolution === 'refund',
+    done: (f) => Boolean(f.bankDetailsLinkSent),
+    tools: ['sendBankDetailsLink'],
+  },
+];
+
+/**
+ * Which open question (if any) the customer's next reply answers —
+ * derived fresh from `facts` every time, never stored. This replaces a
+ * `pendingCapture` field that was manually set by each tool's handler and
+ * had to be manually guarded against being re-armed by a redundant call
+ * to that same tool; that guard was added for checkReturnEligibility,
+ * then forgotten for getAvailableSizes, then forgotten again for
+ * getPickupSlots — three rounds of the identical bug because the "is this
+ * already answered" decision lived in three different places instead of
+ * one. Now it's computed from the same `done` checks FLOW already uses,
+ * so it's structurally impossible for it to say "still pending" about
+ * something `facts` already has an answer for, no matter how many times
+ * the underlying tool gets called.
+ */
+function currentPendingQuestion(f: ConversationFacts): PendingQuestion | undefined {
+  if (f.pendingItemOptions && !f.itemId) return 'item';
+  if (!FLOW.find((s) => s.id === 'reason')!.done(f) && FLOW.find((s) => s.id === 'reason')!.applies(f)) return 'reason';
+  if (!FLOW.find((s) => s.id === 'exchangeSize')!.done(f) && FLOW.find((s) => s.id === 'exchangeSize')!.applies(f))
+    return 'exchangeSize';
+  if (!FLOW.find((s) => s.id === 'slot')!.done(f) && FLOW.find((s) => s.id === 'slot')!.applies(f)) return 'slot';
+  return undefined;
 }
 
 // The exact digit order step 3 of the system prompt declares ("map their
@@ -171,20 +239,41 @@ const REASON_BY_DIGIT: Record<string, string> = {
 
 /** The customer's whole reply as a number, if that's all it is (leading
  * digits up to a word boundary) — e.g. "2" -> 2, "14" -> 14, "2 please" ->
- * 2. Deliberately NOT capped at a single digit: an earlier version only
- * matched [1-9], which meant an out-of-range reply like "14" or "6" was
- * silently invisible to this code and fell through to the model to
- * interpret on its own — which is exactly how it ended up guessing a
- * plausible-looking but wrong option instead of the customer's mistyped
- * one. Used for both resolving a valid choice (captureNextReply) and
- * rejecting an invalid one (validatePendingChoice) against the same
- * number. */
+ * 2. Deliberately NOT capped at a single digit: matching only [1-9] meant
+ * an out-of-range reply like "14" or "6" was silently invisible to this
+ * code and fell through to the model to interpret on its own — which is
+ * exactly how it ended up guessing a plausible-looking but wrong option
+ * instead of the customer's mistyped one. Used for both resolving a valid
+ * choice (captureNextReply) and rejecting an invalid one
+ * (validatePendingChoice) against the same number. */
 function fullNumeral(text: string): number | null {
   const m = text.trim().match(/^(\d+)\b/);
   return m ? Number(m[1]) : null;
 }
 
+/**
+ * Requirement: fail loudly, in the console, the moment the agent redoes a
+ * step `facts` already says is finished — instead of that only surfacing
+ * three rounds later in live testing. Deterministic and tool-call-based,
+ * not text-matching on the agent's reply: if a tool call's step was
+ * already `done` before this call, the model is re-doing work it already
+ * has the answer to (the exact shape of the reported bug — getPickupSlots
+ * called again after the customer had already chosen a slot). A
+ * console.error, never a thrown exception — this is a development
+ * diagnostic, not something that should ever interrupt the demo.
+ */
+function checkForRedundantStep(facts: ConversationFacts, name: string): void {
+  const step = FLOW.find((s) => s.tools.includes(name));
+  if (step && step.applies(facts) && step.done(facts)) {
+    console.error(
+      `[useReturnAgent] STATE MACHINE VIOLATION: ${name} was called again after "${step.label}" was already established — the agent is likely about to re-ask the customer for something it already knows.`,
+      { facts: { ...facts } },
+    );
+  }
+}
+
 function updateFacts(facts: ConversationFacts, name: string, args: Record<string, unknown>, result: unknown): void {
+  checkForRedundantStep(facts, name);
   const r = result as Record<string, unknown> | undefined;
   switch (name) {
     case 'lookupOrder': {
@@ -217,7 +306,6 @@ function updateFacts(facts: ConversationFacts, name: string, args: Record<string
           // model silently picking one for an out-of-range answer like
           // "14" on a 2-item order.
           facts.pendingItemOptions = orders[0].items;
-          facts.pendingCapture = 'item';
         }
       }
       break;
@@ -229,46 +317,29 @@ function updateFacts(facts: ConversationFacts, name: string, args: Record<string
         facts.itemName = r.itemName as string | undefined;
         facts.eligible = r.eligible as boolean | undefined;
         facts.ineligibleReason = r.eligible ? undefined : ((r.reasons as string[] | undefined) ?? []).join(' ');
-        // Only arm reason-capture if we don't already have one. This tool
-        // gets called more than once in practice (the model re-verifying
-        // eligibility before finalizing, seen in live testing) — without
-        // this guard, a redundant later call re-opens the capture window
-        // and treats the customer's NEXT message — which could be a
-        // pickup slot choice, not a reason at all — as a fresh reason,
-        // overwriting the correct one already captured with garbage.
-        if (r.eligible === true && !facts.reason) facts.pendingCapture = 'reason';
       }
       break;
     case 'getAvailableSizes':
-      if (r?.found) {
-        facts.availableSizes = r.availableSizes as string[] | undefined;
-        // Only called (per the system prompt) when reason is "size" and
-        // exchange is being offered — so the customer's next message is
-        // their size choice, unless resolution is already settled (e.g.
-        // this is a redundant re-check after the ticket's already booked).
-        if (!facts.ticketId) facts.pendingCapture = 'exchangeSize';
-      }
+      if (r?.found) facts.availableSizes = r.availableSizes as string[] | undefined;
       break;
     case 'getPickupSlots':
       if (Array.isArray(result)) {
         facts.pickupSlots = result.map((s) => ({ slotId: s.slotId, label: s.label }));
-        if (!facts.ticketId) facts.pendingCapture = 'slot';
       }
       break;
     case 'createReturnTicket':
       if (r?.success && r.ticket) {
         const t = r.ticket as ReturnTicket;
         facts.ticketId = t.ticketId;
-        // Overwrites whatever pending-capture guessed earlier with the
+        // Overwrites whatever positional capture guessed earlier with the
         // model's own validated values — authoritative by construction
-        // (it's what actually got booked), so it corrects a bad
-        // positional guess instead of leaving it to linger in the summary
-        // for the rest of the conversation.
+        // (it's what actually got booked), so it corrects a bad guess
+        // instead of leaving it to linger in the summary for the rest of
+        // the conversation.
         facts.reason = t.reason;
         facts.resolution = t.resolution;
         facts.exchangeSize = t.exchangeSize;
         facts.pickupLabel = t.slot?.label;
-        facts.pendingCapture = undefined;
       }
       break;
     case 'sendBankDetailsLink':
@@ -294,8 +365,8 @@ const BARE_ACKNOWLEDGEMENTS = new Set(['yes', 'yeah', 'yep', 'yup', 'sure', 'ok'
  * undefined if that can't be determined yet (e.g. pickupSlots hasn't
  * loaded). Reason is always exactly the 4 keys in REASON_BY_DIGIT — not
  * dependent on anything having been fetched yet. */
-function pendingOptionCount(facts: ConversationFacts): number | undefined {
-  switch (facts.pendingCapture) {
+function pendingOptionCount(facts: ConversationFacts, pending: PendingQuestion): number | undefined {
+  switch (pending) {
     case 'item':
       return facts.pendingItemOptions?.length;
     case 'reason':
@@ -304,12 +375,10 @@ function pendingOptionCount(facts: ConversationFacts): number | undefined {
       return facts.availableSizes?.length;
     case 'slot':
       return facts.pickupSlots?.length;
-    default:
-      return undefined;
   }
 }
 
-const PENDING_CAPTURE_LABEL: Record<NonNullable<ConversationFacts['pendingCapture']>, string> = {
+const PENDING_QUESTION_LABEL: Record<PendingQuestion, string> = {
   item: 'which item',
   reason: 'the return reason',
   exchangeSize: 'which size',
@@ -330,12 +399,13 @@ const PENDING_CAPTURE_LABEL: Record<NonNullable<ConversationFacts['pendingCaptur
  * an in-range number, or nothing pending all fall through untouched.
  */
 function validatePendingChoice(facts: ConversationFacts, incomingMessage: string): string | undefined {
-  if (!facts.pendingCapture) return undefined;
+  const pending = currentPendingQuestion(facts);
+  if (!pending) return undefined;
   const n = fullNumeral(incomingMessage);
   if (n === null) return undefined;
-  const count = pendingOptionCount(facts);
+  const count = pendingOptionCount(facts, pending);
   if (count === undefined || (n >= 1 && n <= count)) return undefined;
-  const label = PENDING_CAPTURE_LABEL[facts.pendingCapture];
+  const label = PENDING_QUESTION_LABEL[pending];
   return count === 1
     ? `I only have option 1 for ${label} — did you mean that one?`
     : `I only have options 1–${count} for ${label} — which did you mean?`;
@@ -343,12 +413,12 @@ function validatePendingChoice(facts: ConversationFacts, incomingMessage: string
 
 /**
  * Captures the customer's next message as the answer to whichever
- * question is currently pending (see ConversationFacts.pendingCapture),
- * called right before building this turn's context summary so an answer
- * given in the PREVIOUS turn is captured before it can fall out of the
- * recent-message window in some future turn. Only ever called with a
- * message validatePendingChoice has already approved (in range, or not a
- * bare numeral at all) — this function itself doesn't re-check bounds.
+ * question currentPendingQuestion says is open, called right before
+ * building this turn's context summary so an answer given in the
+ * PREVIOUS turn is captured before it can fall out of the recent-message
+ * window in some future turn. Only ever called with a message
+ * validatePendingChoice has already approved (in range, or not a bare
+ * numeral at all) — this function itself doesn't re-check bounds.
  *
  * The one place this maps rather than stores verbatim: a bare numeral
  * reply to the reason question ("2") is meaningless on its own once it's
@@ -360,31 +430,38 @@ function validatePendingChoice(facts: ConversationFacts, incomingMessage: string
  * and pickup-slot numerals are resolved the same way, against whatever
  * was actually offered this conversation (`pendingItemOptions` /
  * `pickupSlots`) rather than a hardcoded table, since those lists are
- * generated, not fixed prompt text. Everything else (item name typed as
- * prose, exchange size) is stored as-is.
+ * generated, not fixed prompt text.
  *
- * Leaves `pendingCapture` set on a bare acknowledgement so the next real
- * answer still gets captured — `createReturnTicket`'s handler in
- * updateFacts is the final backstop if this still ends up wrong.
+ * On a prose reply this can't resolve (an item described by name, or a
+ * pickup constraint like "I'm out of town on the 11th"), it deliberately
+ * does nothing for 'item' (leaves it to checkReturnEligibility's own
+ * itemId argument to resolve properly) but still stores 'slot' verbatim —
+ * that's what lets the model reason from the raw constraint text and
+ * re-offer alternatives, a real behavior worth keeping; `createReturnTicket`'s
+ * handler in updateFacts is the backstop if that ever ends up wrong.
  */
 function captureNextReply(facts: ConversationFacts, incomingMessage: string): void {
-  if (!facts.pendingCapture) return;
+  const pending = currentPendingQuestion(facts);
+  if (!pending) return;
   const trimmed = incomingMessage.trim();
   if (BARE_ACKNOWLEDGEMENTS.has(trimmed.toLowerCase())) return;
 
-  if (facts.pendingCapture === 'item') {
+  if (pending === 'item') {
     const n = fullNumeral(trimmed);
     const options = facts.pendingItemOptions;
     const matched = n && options ? options[n - 1] : undefined;
     if (matched) {
       facts.itemId = matched.itemId;
       facts.itemName = matched.name;
+      facts.pendingItemOptions = undefined;
     }
-    facts.pendingItemOptions = undefined;
-    facts.pendingCapture = undefined;
+    // No match (prose, e.g. "the jeans"): deliberately leave everything
+    // as-is. itemId stays unset, so currentPendingQuestion keeps
+    // returning 'item' until checkReturnEligibility's own itemId argument
+    // resolves it — no guessing at which item prose text refers to.
     return;
   }
-  if (facts.pendingCapture === 'reason') {
+  if (pending === 'reason') {
     const n = fullNumeral(trimmed);
     facts.reason = (n && REASON_BY_DIGIT[String(n)]) || trimmed;
     // Deterministic business rule (see systemPrompt.ts step 4), not a
@@ -392,13 +469,11 @@ function captureNextReply(facts: ConversationFacts, incomingMessage: string): vo
     // exchange path, so any other reason means the resolution is already
     // known right now, well before getAvailableSizes/getPickupSlots run.
     if (facts.reason !== 'size') facts.resolution = 'refund';
-    facts.pendingCapture = undefined;
     return;
   }
-  if (facts.pendingCapture === 'exchangeSize') {
+  if (pending === 'exchangeSize') {
     facts.exchangeSize = trimmed;
     facts.resolution = 'exchange';
-    facts.pendingCapture = undefined;
     return;
   }
   // 'slot'
@@ -406,9 +481,17 @@ function captureNextReply(facts: ConversationFacts, incomingMessage: string): vo
   const bySlots = facts.pickupSlots;
   const matched = n && bySlots ? bySlots[n - 1] : undefined;
   facts.pickupLabel = matched ? matched.label : trimmed;
-  facts.pendingCapture = undefined;
 }
 
+/**
+ * Derives the summary text entirely from `facts` — never the other way
+ * round. Walks FLOW in order so the "already established" list and the
+ * "still needed" framing always match what stepStatus/currentPendingQuestion
+ * would say, instead of this function keeping its own parallel opinion
+ * about what's done (which is exactly what let the pickup-slot bug read
+ * as fixed in the summary while the underlying pendingCapture field had
+ * silently drifted back to "still waiting").
+ */
 function factsToSummary(f: ConversationFacts): string {
   const parts: string[] = [];
   if (f.orderId) parts.push(`order ${f.orderId}`);
@@ -437,6 +520,8 @@ function factsToSummary(f: ConversationFacts): string {
       );
     }
   }
+  const pending = currentPendingQuestion(f);
+  if (pending) parts.push(`still waiting on the customer for: ${PENDING_QUESTION_LABEL[pending]}`);
   return parts.join('. ');
 }
 
@@ -472,12 +557,13 @@ export function useReturnAgent() {
   // back with no customer reply in between (e.g. getPickupSlots then
   // immediately createReturnTicket, seen live on VS1002: the model
   // presented slots and booked the first one in the same breath, without
-  // ever waiting for the customer to actually choose). `pendingCapture`
-  // only clears when captureNextReply processes a genuine NEW customer
-  // message, so if it's still set at the moment createReturnTicket runs,
-  // that question was never actually answered — refuse, same principle as
-  // the eligibility/duplicate-booking guards already enforced in code
-  // rather than left to the prompt.
+  // ever waiting for the customer to actually choose). currentPendingQuestion
+  // only returns undefined once captureNextReply has processed a genuine
+  // NEW customer message for whatever's still open, so if it's still
+  // truthy at the moment createReturnTicket runs, that question was never
+  // actually answered — refuse, same principle as the eligibility/
+  // duplicate-booking guards already enforced in code rather than left to
+  // the prompt.
   const buildExecutors = useCallback(
     (currentBrand: BrandConfig, facts: ConversationFacts): ToolExecutorMap => ({
       lookupOrder: (args) => lookupOrder(currentBrand.catalog, String(args.orderIdOrPhone ?? '')),
@@ -487,10 +573,11 @@ export function useReturnAgent() {
         getAvailableSizesTool(currentBrand.catalog, String(args.orderId ?? ''), String(args.itemId ?? '')),
       getPickupSlots: () => getPickupSlotsTool(),
       createReturnTicket: (args) => {
-        if (facts.pendingCapture) {
+        const pending = currentPendingQuestion(facts);
+        if (pending) {
           return {
             success: false,
-            error: `The customer has not actually answered yet — you still need their reply for ${PENDING_CAPTURE_LABEL[facts.pendingCapture]} before creating a ticket. Present it (if you haven't) and wait for their next message; do not call createReturnTicket until they respond.`,
+            error: `The customer has not actually answered yet — you still need their reply for ${PENDING_QUESTION_LABEL[pending]} before creating a ticket. Present it (if you haven't) and wait for their next message; do not call createReturnTicket until they respond.`,
           };
         }
         const input = args as unknown as CreateReturnTicketInput;
