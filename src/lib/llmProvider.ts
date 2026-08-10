@@ -485,6 +485,10 @@ export function startAgentChat(brand: BrandConfig): ChatSession {
 interface StreamResult {
   content: string;
   toolCalls: ToolCall[];
+  /** Which provider actually answered — surfaced so a caller-side guardrail
+   * (see sendAgentMessage's `guardrail` param) can log which provider it
+   * had to correct, not just that a correction happened. */
+  servedBy: LlmProviderName;
 }
 
 /** How many non-system messages to send verbatim — enough to cover the
@@ -574,11 +578,19 @@ let stickyProviderIndex = 0;
  * across every provider here (all OpenAI-compatible), so only request
  * construction is provider-specific. Gemini does not go through this path
  * at all — see streamGeminiCompletionOnce below.
+ *
+ * `forcedToolName`, when given, requires that specific function instead of
+ * leaving tool use to the model's judgment (`tool_choice: 'auto'` normally)
+ * — used for exactly one thing: sendAgentMessage's guardrail retry, when a
+ * prior reply presented what looks like a slots/sizes/items list without
+ * actually calling the tool that data should have come from. Never set on
+ * a first attempt, only a one-shot corrective retry.
  */
 async function streamOpenAiCompletionOnce(
   spec: OpenAiProviderSpec,
   messages: ChatCompletionMessage[],
   onTextDelta?: (textSoFar: string) => void,
+  forcedToolName?: string,
 ): Promise<StreamResult> {
   const res = await fetch(spec.url, {
     method: 'POST',
@@ -587,7 +599,7 @@ async function streamOpenAiCompletionOnce(
       model: spec.model,
       messages,
       tools: toolDeclarations,
-      tool_choice: 'auto',
+      tool_choice: forcedToolName ? { type: 'function', function: { name: forcedToolName } } : 'auto',
       stream: true,
       ...spec.reasoningParam,
     }),
@@ -651,7 +663,7 @@ async function streamOpenAiCompletionOnce(
     .filter((t) => t.name)
     .map((t) => ({ id: t.id, type: 'function' as const, function: { name: t.name, arguments: t.arguments } }));
 
-  return { content, toolCalls };
+  return { content, toolCalls, servedBy: spec.name };
 }
 
 // --- Gemini adapter. Different message shape (contents/parts, not
@@ -759,11 +771,17 @@ const geminiFunctionDeclarations = toolDeclarations.map((t) => ({
  * currently resolves to a Gemini 3.x model, and those reject
  * `thinkingBudget: 0` outright (`400 INVALID_ARGUMENT`) — 3.x requires its
  * internal thinking pass to stay on, including for function calling.
+ *
+ * `forcedToolName` — see streamOpenAiCompletionOnce's doc for why this
+ * exists; Gemini's equivalent of `tool_choice` is `toolConfig`, mode `ANY`
+ * with an allow-list of exactly one name instead of a `{type, function}`
+ * object, but the effect is the same: the next reply must be that call.
  */
 async function streamGeminiCompletionOnce(
   spec: GeminiProviderSpec,
   messages: ChatCompletionMessage[],
   onTextDelta?: (textSoFar: string) => void,
+  forcedToolName?: string,
 ): Promise<StreamResult> {
   const { systemInstruction, contents } = toGeminiContents(messages);
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${spec.model}:streamGenerateContent?alt=sse`;
@@ -778,6 +796,9 @@ async function streamGeminiCompletionOnce(
       contents,
       ...(systemInstruction ? { systemInstruction } : {}),
       tools: [{ functionDeclarations: geminiFunctionDeclarations }],
+      ...(forcedToolName
+        ? { toolConfig: { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: [forcedToolName] } } }
+        : {}),
     }),
   });
 
@@ -832,7 +853,7 @@ async function streamGeminiCompletionOnce(
     }
   }
 
-  return { content, toolCalls };
+  return { content, toolCalls, servedBy: spec.name };
 }
 
 /** Dispatches to the right adapter based on spec.kind — the only place in
@@ -841,10 +862,11 @@ async function streamProviderOnce(
   spec: AnyProviderSpec,
   messages: ChatCompletionMessage[],
   onTextDelta?: (textSoFar: string) => void,
+  forcedToolName?: string,
 ): Promise<StreamResult> {
   return spec.kind === 'gemini'
-    ? streamGeminiCompletionOnce(spec, messages, onTextDelta)
-    : streamOpenAiCompletionOnce(spec, messages, onTextDelta);
+    ? streamGeminiCompletionOnce(spec, messages, onTextDelta, forcedToolName)
+    : streamOpenAiCompletionOnce(spec, messages, onTextDelta, forcedToolName);
 }
 
 /**
@@ -863,6 +885,7 @@ async function streamProviderOnce(
 async function streamChatCompletion(
   messages: ChatCompletionMessage[],
   onTextDelta?: (textSoFar: string) => void,
+  forcedToolName?: string,
 ): Promise<StreamResult> {
   const providers = getConfiguredProviders();
   if (providers.length === 0) {
@@ -874,7 +897,7 @@ async function streamChatCompletion(
   for (let i = stickyProviderIndex; i < providers.length; i += 1) {
     const spec = providers[i];
     try {
-      const result = await streamProviderOnce(spec, messages, onTextDelta);
+      const result = await streamProviderOnce(spec, messages, onTextDelta, forcedToolName);
 
       // A completion with no tool calls AND no text is not a valid reply —
       // seen in practice as a stream that returns 200 and a normal-looking
@@ -920,6 +943,31 @@ async function streamChatCompletion(
  * `onTextDelta` streams the final reply into the UI as it's generated.
  * `contextSummary`, if given, stands in for everything older than the
  * recent-message window sent on the wire — see buildRequestMessages.
+ *
+ * `guardrail`, if given, is checked once — only against this customer
+ * message's very first assistant reply, before anything else has had a
+ * chance to happen — and only when that reply has NO tool calls at all.
+ * It exists for one specific failure mode, seen live on a weaker fallback
+ * provider: instead of calling getPickupSlots/getAvailableSizes/lookupOrder
+ * to fetch real options, the model sometimes just writes a plausible-
+ * looking numbered list from nothing (confirmed via the tool-call log —
+ * zero calls that turn — while the text read exactly like real tool
+ * output, invented dates included). `guardrail` receives that reply's
+ * text and returns the tool name that should have produced it, or
+ * undefined if the text doesn't look like a fabricated options list (a
+ * legitimate reply — including answering an unrelated digression instead
+ * of the pending question — always returns undefined and is left alone).
+ * If it returns a name, this reply is discarded (never shown to the
+ * customer, never added to `chat.messages`) and retried exactly once with
+ * that one tool forced via `tool_choice` for that single request only —
+ * `tool_choice` stays `'auto'` everywhere else, on every other round, on
+ * every other provider, so this never costs the model its ability to
+ * field a genuine digression. While the guardrail is armed, streamed text
+ * is buffered instead of forwarded live, so a discarded attempt is never
+ * even flashed on screen before the corrected reply replaces it — the one
+ * UX cost is that this specific reply appears all at once instead of
+ * streaming token-by-token. Every trigger is logged with which provider
+ * needed correcting, so a pattern by provider is visible over time.
  */
 export async function sendAgentMessage(
   chat: ChatSession,
@@ -928,14 +976,45 @@ export async function sendAgentMessage(
   onToolCall?: (name: string, args: Record<string, unknown>, result: unknown) => void,
   onTextDelta?: (textSoFar: string) => void,
   contextSummary?: string,
+  guardrail?: (content: string) => string | undefined,
 ): Promise<string> {
   chat.messages.push({ role: 'user', content: message });
 
   let guard = 0;
+  let forcedToolName: string | undefined;
+  let guardrailRetried = false;
+  let guardrailArmed = Boolean(guardrail);
   while (guard < 6) {
     guard += 1;
     const requestMessages = buildRequestMessages(chat.messages, contextSummary);
-    const { content, toolCalls } = await streamChatCompletion(requestMessages, onTextDelta);
+
+    let buffered = '';
+    const deltaSink = guardrailArmed
+      ? (textSoFar: string) => {
+          buffered = textSoFar;
+        }
+      : onTextDelta;
+
+    const { content, toolCalls, servedBy } = await streamChatCompletion(requestMessages, deltaSink, forcedToolName);
+    forcedToolName = undefined; // one-shot — only ever applies to the single request it was set for
+
+    if (guardrailArmed && toolCalls.length === 0 && !guardrailRetried) {
+      const requiredTool = guardrail!(content);
+      if (requiredTool) {
+        guardrailRetried = true;
+        console.warn(
+          `[llmProvider] guardrail: ${servedBy} presented what looks like an options list without calling ${requiredTool} this turn — discarding and forcing a retry`,
+          { content },
+        );
+        forcedToolName = requiredTool;
+        continue;
+      }
+    }
+
+    if (guardrailArmed) {
+      onTextDelta?.(buffered || content);
+      guardrailArmed = false; // this customer message's guarded window is over either way — text-only or tool-backed, later rounds in this same exchange stream live as normal
+    }
 
     if (toolCalls.length > 0) {
       chat.messages.push({ role: 'assistant', content: content || null, tool_calls: toolCalls });

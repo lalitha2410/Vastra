@@ -257,6 +257,51 @@ function currentPendingQuestion(f: ConversationFacts): PendingQuestion | undefin
   return undefined;
 }
 
+/**
+ * Which tool the customer's pending question, if any, should be answered
+ * from — used to build sendAgentMessage's guardrail (see below). Only the
+ * pending questions actually backed by a tool are listed: 'reason' isn't
+ * (the 4 options are fixed script text, not fetched data — see FLOW's own
+ * comment), so it's deliberately absent.
+ */
+const GUARDRAIL_TOOL_FOR_PENDING: Partial<Record<PendingQuestion, string>> = {
+  item: 'lookupOrder',
+  exchangeSize: 'getAvailableSizes',
+  slot: 'getPickupSlots',
+  rescheduleSlot: 'rescheduleReturnPickup',
+};
+
+/**
+ * True for text that reads like a numbered options list (2+ list markers —
+ * either the emoji numerals the prompts ask for, or a plain "1." style
+ * fallback) — the shape a slots/sizes/items answer always takes, and NOT
+ * the shape most other replies take. A single incidental number doesn't
+ * count; a genuine list of options does. Deliberately generic (doesn't
+ * know or care whether the list is slots, sizes, or items) — the caller
+ * already knows which one is pending, this only answers "does this text
+ * look like *a* list."
+ */
+function looksLikeFabricatedOptionsList(text: string): boolean {
+  const markers = text.match(/[1-9]️?⃣|\b[1-9]\./g) ?? [];
+  return markers.length >= 2;
+}
+
+/**
+ * Builds sendAgentMessage's `guardrail` argument from the facts as they
+ * stand right before a customer message is sent — i.e. this captures
+ * "what SHOULD the very next assistant reply be backed by," computed once,
+ * not re-evaluated turn-by-turn. See sendAgentMessage's own doc for the
+ * full mechanism (buffer, detect, discard, force-retry once). Returns
+ * undefined when nothing is pending that this guard applies to, so the
+ * common case (most turns) costs nothing — no buffering, no check.
+ */
+function buildOptionsListGuardrail(facts: ConversationFacts): ((content: string) => string | undefined) | undefined {
+  const pending = currentPendingQuestion(facts);
+  const requiredTool = pending ? GUARDRAIL_TOOL_FOR_PENDING[pending] : undefined;
+  if (!requiredTool) return undefined;
+  return (content: string) => (looksLikeFabricatedOptionsList(content) ? requiredTool : undefined);
+}
+
 // The exact digit order step 3 of the system prompt declares ("map their
 // answer to: size, quality, not_as_described, changed_mind") — kept in
 // sync with that wording by hand, not derived from it, since the prompt
@@ -841,6 +886,7 @@ export function useReturnAgent() {
           },
           (textSoFar) => setChatStreamingText(textSoFar),
           factsToSummary(chatFactsRef.current),
+          buildOptionsListGuardrail(chatFactsRef.current),
         );
         setChatMessages((prev) => [...prev, { id: uid(), role: 'agent', text: reply, timestamp: Date.now() }]);
       } catch (err) {
@@ -989,6 +1035,7 @@ export function useReturnAgent() {
           },
           (textSoFar) => setVoiceStreamingText(textSoFar),
           factsToSummary(voiceFactsRef.current),
+          buildOptionsListGuardrail(voiceFactsRef.current),
         );
         setCallMessages((prev) => [...prev, { id: uid(), role: 'agent', text: reply, timestamp: Date.now() }]);
         speakAgentLine(reply);
