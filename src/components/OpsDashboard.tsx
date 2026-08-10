@@ -8,6 +8,9 @@ import { TicketCard, TicketTableHeader } from './TicketCard';
 interface OpsDashboardProps {
   brand: BrandConfig;
   tickets: ReturnTicket[];
+  /** Demo-only ticket status control — see TicketCard's "Advance (demo)"
+   * button. */
+  onAdvanceTicket: (ticketId: string) => void;
   stats: Stats;
   toolActivity: string | null;
   channel: Channel;
@@ -56,6 +59,7 @@ function TranscriptLines({ brand, entries }: { brand: BrandConfig; entries: Tran
 export function OpsDashboard({
   brand,
   tickets,
+  onAdvanceTicket,
   stats,
   toolActivity,
   channel,
@@ -185,7 +189,7 @@ export function OpsDashboard({
           <div className="min-w-215 rounded-md border border-[#e2e4e8] bg-white">
             <TicketTableHeader />
             {tickets.map((t) => (
-              <TicketCard key={t.ticketId} ticket={t} accent={brand.colors.primary} />
+              <TicketCard key={t.ticketId} ticket={t} accent={brand.colors.primary} onAdvance={onAdvanceTicket} />
             ))}
           </div>
         )}

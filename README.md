@@ -164,6 +164,11 @@ beyond a live call.
   one-off build. Resets both channels (see below).
 - **Reset** — clears both channels' conversations and the shared ticket
   history, ends any active call, and starts fresh.
+- **▸ Advance (demo)** (ops console, per ticket row) — a clearly-labeled
+  demo-only control, not product behavior: moves that one ticket one step
+  forward in its status pipeline (see "What's real vs. mocked" below for
+  why nothing does this automatically). Lets a presenter show the full
+  pipeline completing in a live demo on their own timing.
 
 ### Voice channel specifics
 
@@ -217,10 +222,18 @@ beyond a live call.
   informational text only.
 - Inventory — `getAvailableSizes` reads from the seed catalog, not a live
   inventory system.
-- Ticket status progression after creation (Approved → Pickup Scheduled → In
-  Transit → Refunded) is time-compressed (~12 seconds total) so the pipeline
-  visibly completes during a live call, instead of the days it would
-  realistically take.
+- Ticket status progression after creation. A new ticket starts at
+  "Pickup Scheduled" (eligibility and a pickup slot are both already
+  real facts by then) and stays there — the app has no courier or bank
+  integration to react to, so nothing auto-advances it through "In
+  Transit" or the final step ("Refunded" / "Awaiting Bank Details" /
+  "Exchanged", branching correctly by payment method and resolution —
+  see `statusSequenceFor` in `src/types.ts`) on a fake timer claiming
+  those events happened. To let a presenter show the full pipeline live,
+  each ticket row has a dashed, clearly-labeled **"▸ Advance (demo)"**
+  button (`src/components/TicketCard.tsx`) that moves it one real step at
+  a time — a click is an explicit, attributable action, not the ticket
+  claiming something happened on its own.
 
 ## Design decisions
 

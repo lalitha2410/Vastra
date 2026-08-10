@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { BrandConfig } from '../config/brand';
 import { getBrandById, vastraBrand } from '../config/brand';
-import type { CallLogEntry, CallStatus, Channel, ChatMessage, ReturnTicket, TranscriptEntry } from '../types';
+import {
+  statusSequenceFor,
+  type CallLogEntry,
+  type CallStatus,
+  type Channel,
+  type ChatMessage,
+  type ReturnTicket,
+  type TranscriptEntry,
+} from '../types';
 import {
   getActiveProvider,
   hasApiKey,
@@ -546,6 +554,31 @@ export function useReturnAgent() {
   useEffect(() => {
     ticketsRef.current = tickets;
   }, [tickets]);
+
+  /**
+   * Demo-only control (see TicketCard's "Advance (demo)" button) — moves a
+   * ticket exactly one step forward in its OWN status sequence (see
+   * statusSequenceFor in types.ts, which already branches correctly by
+   * resolution/payment method). This exists because the pipeline
+   * deliberately no longer auto-advances on a fake timer (see the
+   * "Awaiting Bank Details" / "In Transit" fixes) — real events like a
+   * courier pickup or a bank-details submission aren't simulated
+   * anywhere in this app, so nothing should silently claim they happened.
+   * A presenter clicking this button IS the "real event" here: an
+   * explicit, visible, attributable action, not a claim the ticket makes
+   * about itself. No-ops once a ticket is already at its final status.
+   */
+  const advanceTicketStatus = useCallback((ticketId: string) => {
+    setTickets((prev) =>
+      prev.map((t) => {
+        if (t.ticketId !== ticketId) return t;
+        const sequence = statusSequenceFor(t);
+        const next = sequence[sequence.indexOf(t.status) + 1];
+        return next ? { ...t, status: next } : t;
+      }),
+    );
+  }, []);
+
   // Executors run inside an async tool-call loop (see sendAgentMessage), so
   // they need the *current* ticket list at call time for the duplicate-
   // booking guard, not whatever was in scope when this closure was built —
@@ -901,6 +934,7 @@ export function useReturnAgent() {
     channel,
     setChannel,
     tickets,
+    advanceTicketStatus,
     stats,
     apiKeyMissing,
     reset,

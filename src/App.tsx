@@ -9,7 +9,7 @@ import { SplitView } from './components/SplitView';
 import { IntroOverlay } from './components/IntroOverlay';
 
 function App() {
-  const { brand, setBrand, channel, setChannel, tickets, stats, apiKeyMissing, reset, chat, voice } =
+  const { brand, setBrand, channel, setChannel, tickets, advanceTicketStatus, stats, apiKeyMissing, reset, chat, voice } =
     useReturnAgent();
   // Deliberately not part of useReturnAgent's state — Reset should never
   // bring this back mid-demo, only a fresh page load should.
@@ -57,6 +57,7 @@ function App() {
           <OpsDashboard
             brand={brand}
             tickets={tickets}
+            onAdvanceTicket={advanceTicketStatus}
             stats={stats}
             toolActivity={channel === 'voice' ? voice.toolActivity : chat.toolActivity}
             channel={channel}
