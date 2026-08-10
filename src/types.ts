@@ -43,7 +43,13 @@ export type TicketStatus =
   | 'In Transit'
   | 'Refunded'
   | 'Awaiting Bank Details'
-  | 'Exchanged';
+  | 'Exchanged'
+  /** An out-of-band exit, not a pipeline step — a cancelled ticket never
+   * appears in statusSequenceFor's sequence (see cancelReturnTicketTool in
+   * tools.ts, which only allows cancelling from 'Pickup Scheduled'). The
+   * ops console renders it as a plain badge instead of the 5-step
+   * pipeline (see TicketCard.tsx) since "cancelled" isn't progress. */
+  | 'Cancelled';
 
 /**
  * The pipeline's first four steps (courier-side: approved, scheduled,

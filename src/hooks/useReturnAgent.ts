@@ -24,6 +24,10 @@ import {
   lookupOrder,
   checkReturnEligibilityTool,
   sendBankDetailsLinkTool,
+  lookupReturnTicketTool,
+  listReschedulableSlotsTool,
+  rescheduleReturnPickupTool,
+  cancelReturnTicketTool,
   type CreateReturnTicketInput,
 } from '../lib/tools';
 import { buildSystemInstruction } from '../lib/systemPrompt';
@@ -64,6 +68,9 @@ const TOOL_ACTIVITY_LABELS: Record<string, string> = {
   getPickupSlots: 'Fetching pickup slots…',
   createReturnTicket: 'Creating return ticket…',
   sendBankDetailsLink: 'Sending bank details link…',
+  lookupReturnTicket: 'Looking up return ticket…',
+  rescheduleReturnPickup: 'Checking reschedule options…',
+  cancelReturnTicket: 'Cancelling return…',
 };
 
 const CHAT_THINKING_LABEL = 'Reading customer message…';
@@ -137,9 +144,19 @@ interface ConversationFacts {
    * send or claim to send again" instead of the model being the only
    * record of whether that happened. */
   bankDetailsLinkSent?: boolean;
+  /** Reschedule-in-progress for an EXISTING ticket — deliberately separate
+   * from pickupSlots/pickupLabel (the create-flow's own fields) so asking
+   * about, or rescheduling, an existing ticket never touches the facts of
+   * a return still being created in the same conversation. Armed when
+   * listReschedulableSlotsTool succeeds (see updateFacts); cleared once
+   * the customer's next reply resolves a choice, or the reschedule
+   * completes/fails. */
+  rescheduleTicketId?: string;
+  rescheduleOfferedSlots?: { slotId: string; label: string }[];
+  rescheduleNewSlotLabel?: string;
 }
 
-type PendingQuestion = 'item' | 'reason' | 'exchangeSize' | 'slot';
+type PendingQuestion = 'item' | 'reason' | 'exchangeSize' | 'slot' | 'rescheduleSlot';
 
 /**
  * The ordered steps of a return, in the order the system prompt walks
@@ -224,6 +241,14 @@ const FLOW: FlowStep[] = [
  * the underlying tool gets called.
  */
 function currentPendingQuestion(f: ConversationFacts): PendingQuestion | undefined {
+  // Checked first — a reschedule on an existing ticket is a short,
+  // focused digression the customer wants resolved before anything else,
+  // including a return still being created in the same conversation. Kept
+  // entirely independent of the create-flow's own fields (see the facts
+  // above), so this priority choice never corrupts a return in progress —
+  // it only affects which question the customer's VERY NEXT reply answers
+  // if both happen to be open at once, a deliberately narrow trade-off.
+  if (f.rescheduleTicketId && !f.rescheduleNewSlotLabel) return 'rescheduleSlot';
   if (f.pendingItemOptions && !f.itemId) return 'item';
   if (!FLOW.find((s) => s.id === 'reason')!.done(f) && FLOW.find((s) => s.id === 'reason')!.applies(f)) return 'reason';
   if (!FLOW.find((s) => s.id === 'exchangeSize')!.done(f) && FLOW.find((s) => s.id === 'exchangeSize')!.applies(f))
@@ -369,6 +394,22 @@ function updateFacts(facts: ConversationFacts, name: string, args: Record<string
     case 'sendBankDetailsLink':
       if (r?.found) facts.bankDetailsLinkSent = true;
       break;
+    case 'rescheduleReturnPickup':
+      // Two-phase, mirroring the create-flow's own slot step: a
+      // successful "list" call (has availableSlots) arms the pending
+      // question; a successful/no-op "apply" call (has ticket, or
+      // alreadyThatSlot) resolves it. A failed call (found: false) arms
+      // nothing — there's no list to choose from.
+      if (r?.availableSlots) {
+        facts.rescheduleTicketId = String(args.ticketId ?? '');
+        facts.rescheduleOfferedSlots = r.availableSlots as { slotId: string; label: string }[];
+        facts.rescheduleNewSlotLabel = undefined;
+      } else if (r?.ticket || r?.alreadyThatSlot) {
+        facts.rescheduleTicketId = undefined;
+        facts.rescheduleOfferedSlots = undefined;
+        facts.rescheduleNewSlotLabel = undefined;
+      }
+      break;
   }
 }
 
@@ -399,6 +440,8 @@ function pendingOptionCount(facts: ConversationFacts, pending: PendingQuestion):
       return facts.availableSizes?.length;
     case 'slot':
       return facts.pickupSlots?.length;
+    case 'rescheduleSlot':
+      return facts.rescheduleOfferedSlots?.length;
   }
 }
 
@@ -407,6 +450,7 @@ const PENDING_QUESTION_LABEL: Record<PendingQuestion, string> = {
   reason: 'the return reason',
   exchangeSize: 'which size',
   slot: 'which pickup slot',
+  rescheduleSlot: 'which new pickup slot',
 };
 
 /**
@@ -470,6 +514,13 @@ function captureNextReply(facts: ConversationFacts, incomingMessage: string): vo
   const trimmed = incomingMessage.trim();
   if (BARE_ACKNOWLEDGEMENTS.has(trimmed.toLowerCase())) return;
 
+  if (pending === 'rescheduleSlot') {
+    const n = fullNumeral(trimmed);
+    const bySlots = facts.rescheduleOfferedSlots;
+    const matched = n && bySlots ? bySlots[n - 1] : undefined;
+    facts.rescheduleNewSlotLabel = matched ? matched.label : trimmed;
+    return;
+  }
   if (pending === 'item') {
     const n = fullNumeral(trimmed);
     const options = facts.pendingItemOptions;
@@ -544,6 +595,11 @@ function factsToSummary(f: ConversationFacts): string {
       );
     }
   }
+  if (f.rescheduleTicketId && f.rescheduleOfferedSlots?.length) {
+    parts.push(
+      `rescheduling ${f.rescheduleTicketId} — new slots offered: ${f.rescheduleOfferedSlots.map((s) => `${s.slotId}=${s.label}`).join('; ')}`,
+    );
+  }
   const pending = currentPendingQuestion(f);
   if (pending) parts.push(`still waiting on the customer for: ${PENDING_QUESTION_LABEL[pending]}`);
   return parts.join('. ');
@@ -587,7 +643,7 @@ export function useReturnAgent() {
   const advanceTicketStatus = useCallback((ticketId: string) => {
     setTickets((prev) =>
       prev.map((t) => {
-        if (t.ticketId !== ticketId) return t;
+        if (t.ticketId !== ticketId || t.status === 'Cancelled') return t;
         const sequence = statusSequenceFor(t);
         const next = sequence[sequence.indexOf(t.status) + 1];
         return next ? { ...t, status: next } : t;
@@ -647,7 +703,63 @@ export function useReturnAgent() {
         return { success: false, error: result.error };
       },
       sendBankDetailsLink: (args) => {
-        const { result, ticket } = sendBankDetailsLinkTool(ticketsRef.current, String(args.ticketId ?? ''));
+        if (!facts.orderId) {
+          return { found: false, error: 'No order identified yet in this conversation — ask for the order ID or phone number first.' };
+        }
+        const { result, ticket } = sendBankDetailsLinkTool(ticketsRef.current, String(args.ticketId ?? ''), facts.orderId);
+        if (ticket) {
+          setTickets((prev) => prev.map((t) => (t.ticketId === ticket.ticketId ? ticket : t)));
+        }
+        return result;
+      },
+      // The three tools below never trust an orderId the model supplies —
+      // they always use facts.orderId, the order THIS conversation already
+      // verified via lookupOrder. A confused or adversarial model literally
+      // cannot query a different customer's ticket by passing a different
+      // orderId, because there's no orderId parameter on these tools at
+      // all for it to pass — same principle as the policy engine: enforced
+      // in code, not by trusting what the model claims.
+      lookupReturnTicket: (args) => {
+        if (!facts.orderId) {
+          return { found: false, error: 'No order identified yet in this conversation — ask for the order ID or phone number first.' };
+        }
+        return lookupReturnTicketTool(ticketsRef.current, facts.orderId, args.ticketId ? String(args.ticketId) : undefined);
+      },
+      rescheduleReturnPickup: (args) => {
+        if (!facts.orderId) {
+          return { found: false, error: 'No order identified yet in this conversation — ask for the order ID or phone number first.' };
+        }
+        const ticketId = String(args.ticketId ?? '');
+        const newSlotId = args.newSlotId ? String(args.newSlotId) : undefined;
+
+        if (!newSlotId) {
+          // "List available slots" mode — see updateFacts's
+          // rescheduleReturnPickup case, which arms rescheduleTicketId
+          // from a successful result here.
+          return listReschedulableSlotsTool(ticketsRef.current, facts.orderId, ticketId);
+        }
+
+        // "Apply a chosen slot" mode — refuses unless the customer has
+        // actually answered since the slots were listed, exactly the
+        // createReturnTicket guard above, applied to reschedule.
+        const pending = currentPendingQuestion(facts);
+        if (facts.rescheduleTicketId !== ticketId || pending === 'rescheduleSlot') {
+          return {
+            found: false,
+            error: `The customer hasn't actually chosen a new slot for ${ticketId} yet — list the available slots first (if you haven't) and wait for their reply before rescheduling.`,
+          };
+        }
+        const { result, ticket } = rescheduleReturnPickupTool(ticketsRef.current, facts.orderId, ticketId, newSlotId);
+        if (ticket) {
+          setTickets((prev) => prev.map((t) => (t.ticketId === ticket.ticketId ? ticket : t)));
+        }
+        return result;
+      },
+      cancelReturnTicket: (args) => {
+        if (!facts.orderId) {
+          return { found: false, error: 'No order identified yet in this conversation — ask for the order ID or phone number first.' };
+        }
+        const { result, ticket } = cancelReturnTicketTool(ticketsRef.current, facts.orderId, String(args.ticketId ?? ''));
         if (ticket) {
           setTickets((prev) => prev.map((t) => (t.ticketId === ticket.ticketId ? ticket : t)));
         }
@@ -668,10 +780,13 @@ export function useReturnAgent() {
       );
     };
     const returnsToday = tickets.filter((t) => isToday(t.createdAt)).length;
-    const exchangeCount = tickets.filter((t) => t.resolution === 'exchange').length;
-    const refundCount = tickets.filter((t) => t.resolution === 'refund').length;
+    // A cancelled return didn't actually happen, so it shouldn't count
+    // toward the exchange/refund split or the value it would have
+    // retained — only returnsToday (raw request volume) still counts it.
+    const exchangeCount = tickets.filter((t) => t.resolution === 'exchange' && t.status !== 'Cancelled').length;
+    const refundCount = tickets.filter((t) => t.resolution === 'refund' && t.status !== 'Cancelled').length;
     const valueRetained = tickets
-      .filter((t) => t.resolution === 'exchange')
+      .filter((t) => t.resolution === 'exchange' && t.status !== 'Cancelled')
       .reduce((sum, t) => sum + t.itemPrice, 0);
     return { returnsToday, exchangeCount, refundCount, valueRetained };
   }, [tickets]);

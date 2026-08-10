@@ -299,6 +299,52 @@ const toolDeclarations: ToolDeclaration[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'lookupReturnTicket',
+      description:
+        "Look up the status of an EXISTING return ticket (refund/exchange status, pickup slot, refund amount, settlement timing) — for follow-up questions like 'where's my refund', 'when is my pickup', or 'what happened to my return'. Omit ticketId to list every ticket for the order if the customer didn't give a specific ID (e.g. they just asked 'where's my refund' with no ID) — if they have more than one, present the list and ask which. Never call before the order/phone has already been identified this conversation.",
+      parameters: {
+        type: 'object',
+        properties: {
+          ticketId: { type: 'string', description: 'The ticket ID, e.g. "RET-1001", if the customer gave one. Omit to list all tickets for the order.' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'rescheduleReturnPickup',
+      description:
+        "Change the pickup slot on an EXISTING return ticket. Two-step: call with ONLY ticketId first to see the available slots (this will refuse if the pickup already happened or the ticket is cancelled/complete) — present them and wait for the customer's choice. Call again with ticketId AND newSlotId only once they've actually picked one; never guess a slot they haven't stated. If they ask for the slot already booked, this will say so rather than silently rebooking it.",
+      parameters: {
+        type: 'object',
+        properties: {
+          ticketId: { type: 'string', description: 'The ticket ID, e.g. "RET-1001".' },
+          newSlotId: { type: 'string', description: 'The new slot ID the customer chose, e.g. "slot-2". Omit to just see the available options.' },
+        },
+        required: ['ticketId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'cancelReturnTicket',
+      description:
+        "Cancel an EXISTING return ticket. Only possible before the pickup has actually happened — refuses with a reason if the courier already collected the item, if the return is already complete (refunded/exchanged), or if it's already cancelled. Relay whatever this tool says plainly, including any refusal reason.",
+      parameters: {
+        type: 'object',
+        properties: {
+          ticketId: { type: 'string', description: 'The ticket ID to cancel, e.g. "RET-1001".' },
+        },
+        required: ['ticketId'],
+      },
+    },
+  },
 ];
 
 export type ToolExecutor = (args: Record<string, unknown>) => unknown;

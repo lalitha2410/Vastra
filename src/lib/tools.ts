@@ -1,4 +1,4 @@
-import type { Order, OrderItem, PickupSlot, ReturnReason, Resolution, ReturnTicket } from '../types';
+import type { Order, OrderItem, PaymentMethod, PickupSlot, ReturnReason, Resolution, ReturnTicket, TicketStatus } from '../types';
 import { checkEligibility } from './policy';
 
 /**
@@ -183,8 +183,10 @@ export function createReturnTicketTool(
   const match = findOrderAndItem(catalog, input.orderId, input.itemId);
   if (!match) return { found: false, error: 'Order or item not found.' };
 
+  // Excludes cancelled tickets: a cancelled return didn't happen, so it
+  // shouldn't permanently block ever returning that item again.
   const priorTicket = existingTickets.find(
-    (t) => t.orderId === match.order.orderId && t.itemId === match.item.itemId,
+    (t) => t.orderId === match.order.orderId && t.itemId === match.item.itemId && t.status !== 'Cancelled',
   );
   if (priorTicket) {
     return {
@@ -273,9 +275,12 @@ export interface SendBankDetailsLinkResult {
 export function sendBankDetailsLinkTool(
   tickets: ReturnTicket[],
   ticketId: string,
+  authenticatedOrderId: string,
   now: number = Date.now(),
 ): { result: SendBankDetailsLinkResult; ticket: ReturnTicket | null } {
-  const ticket = tickets.find((t) => t.ticketId === ticketId);
+  const ticket = tickets.find(
+    (t) => t.ticketId.toUpperCase() === ticketId.trim().toUpperCase() && t.orderId.toUpperCase() === authenticatedOrderId.trim().toUpperCase(),
+  );
   if (!ticket) return { result: { found: false, error: 'No ticket with that ID.' }, ticket: null };
 
   if (ticket.paymentMethod !== 'COD') {
@@ -312,4 +317,222 @@ export function sendBankDetailsLinkTool(
     },
     ticket: updated,
   };
+}
+
+// ---------------------------------------------------------------------
+// lookupReturnTicket
+// ---------------------------------------------------------------------
+
+export interface ReturnTicketDetail {
+  ticketId: string;
+  itemName: string;
+  reason: ReturnReason;
+  resolution: Resolution;
+  exchangeSize?: string;
+  status: TicketStatus;
+  slot?: PickupSlot;
+  refundAmount: number;
+  refundDestination: string;
+  paymentMethod: PaymentMethod;
+  bankDetailsLinkSent: boolean;
+  /** Deterministic, ticket-specific guidance on refund timing — computed
+   * here, not left for the model to recall from the system prompt, so
+   * "where's my refund" always gets the same correct answer instead of
+   * whatever the model half-remembers. undefined when there's nothing
+   * settlement-related to say yet (still in progress). */
+  settlementNote?: string;
+}
+
+export interface LookupReturnTicketResult {
+  found: boolean;
+  /** True when no specific ticketId was given and this order has more
+   * than one ticket — `tickets` is a short summary list the model must
+   * relay so the customer can pick one; `ticket` is absent in this case. */
+  multiple?: boolean;
+  tickets?: { ticketId: string; itemName: string; status: TicketStatus }[];
+  ticket?: ReturnTicketDetail;
+}
+
+function settlementNoteFor(ticket: ReturnTicket): string | undefined {
+  if (ticket.resolution === 'exchange') {
+    return ticket.status === 'Exchanged' ? 'Exchange complete — no refund is involved.' : undefined;
+  }
+  if (ticket.status === 'Refunded') {
+    return 'Refunded to the original payment method — these typically settle within 3–5 business days.';
+  }
+  if (ticket.status === 'Awaiting Bank Details') {
+    return ticket.bankDetailsLinkSentAt
+      ? 'On hold: the secure bank-details link has been sent but not yet submitted — the refund cannot move until it is.'
+      : 'On hold: a secure link for bank details has not been sent yet — send one before the refund can proceed.';
+  }
+  return undefined;
+}
+
+function toDetail(t: ReturnTicket): ReturnTicketDetail {
+  return {
+    ticketId: t.ticketId,
+    itemName: t.itemName,
+    reason: t.reason,
+    resolution: t.resolution,
+    exchangeSize: t.exchangeSize,
+    status: t.status,
+    slot: t.slot,
+    refundAmount: t.refundAmount,
+    refundDestination: t.refundDestination,
+    paymentMethod: t.paymentMethod,
+    bankDetailsLinkSent: Boolean(t.bankDetailsLinkSentAt),
+    settlementNote: settlementNoteFor(t),
+  };
+}
+
+/**
+ * `authenticatedOrderId` is never something the model can influence — see
+ * useReturnAgent.ts's buildExecutors, which always passes the order this
+ * conversation actually verified via lookupOrder, never a value the model
+ * supplies. A ticket ID that doesn't exist and a ticket ID that belongs to
+ * a different order are deliberately indistinguishable to the caller
+ * (`found: false` either way) — a customer probing IDs shouldn't be able
+ * to tell "wrong ID" from "not yours" apart from the response.
+ */
+export function lookupReturnTicketTool(
+  tickets: ReturnTicket[],
+  authenticatedOrderId: string,
+  ticketId?: string,
+): LookupReturnTicketResult {
+  const owned = tickets.filter((t) => t.orderId.toUpperCase() === authenticatedOrderId.trim().toUpperCase());
+
+  if (ticketId) {
+    const match = owned.find((t) => t.ticketId.toUpperCase() === ticketId.trim().toUpperCase());
+    if (!match) return { found: false };
+    return { found: true, ticket: toDetail(match) };
+  }
+
+  if (owned.length === 0) return { found: false, tickets: [] };
+  if (owned.length === 1) return { found: true, ticket: toDetail(owned[0]) };
+  return {
+    found: true,
+    multiple: true,
+    tickets: owned.map((t) => ({ ticketId: t.ticketId, itemName: t.itemName, status: t.status })),
+  };
+}
+
+// ---------------------------------------------------------------------
+// rescheduleReturnPickup — two-phase, same principle as ticket creation's
+// slot selection: listing options and acting on a choice are separate
+// calls, and the "act" call refuses unless a genuine customer reply
+// resolved a choice since the "list" call (see useReturnAgent.ts's
+// rescheduleTicketId/rescheduleOfferedSlots facts and currentPendingQuestion).
+// ---------------------------------------------------------------------
+
+export interface ReschedulePickupListResult {
+  found: boolean;
+  error?: string;
+  ticketId?: string;
+  currentSlot?: PickupSlot;
+  availableSlots?: PickupSlot[];
+}
+
+export function listReschedulableSlotsTool(
+  tickets: ReturnTicket[],
+  authenticatedOrderId: string,
+  ticketId: string,
+  now: Date = new Date(),
+): ReschedulePickupListResult {
+  const ticket = tickets.find(
+    (t) => t.ticketId.toUpperCase() === ticketId.trim().toUpperCase() && t.orderId.toUpperCase() === authenticatedOrderId.trim().toUpperCase(),
+  );
+  if (!ticket) return { found: false, error: 'No ticket with that ID.' };
+  if (ticket.status !== 'Pickup Scheduled') {
+    const reason =
+      ticket.status === 'Cancelled'
+        ? 'this return has been cancelled'
+        : ticket.status === 'In Transit'
+          ? 'the pickup has already happened'
+          : 'this return is already complete';
+    return { found: false, error: `Can't reschedule ${ticket.ticketId} — ${reason}.` };
+  }
+  return {
+    found: true,
+    ticketId: ticket.ticketId,
+    currentSlot: ticket.slot,
+    availableSlots: getPickupSlotsTool(now),
+  };
+}
+
+export interface ReschedulePickupApplyResult {
+  found: boolean;
+  error?: string;
+  /** True when the requested slot is the one already booked — the caller
+   * relays this instead of silently no-op "re-booking" it. */
+  alreadyThatSlot?: boolean;
+  ticket?: { ticketId: string; slot: PickupSlot };
+}
+
+export function rescheduleReturnPickupTool(
+  tickets: ReturnTicket[],
+  authenticatedOrderId: string,
+  ticketId: string,
+  newSlotId: string,
+  now: Date = new Date(),
+): { result: ReschedulePickupApplyResult; ticket: ReturnTicket | null } {
+  const ticket = tickets.find(
+    (t) => t.ticketId.toUpperCase() === ticketId.trim().toUpperCase() && t.orderId.toUpperCase() === authenticatedOrderId.trim().toUpperCase(),
+  );
+  if (!ticket) return { result: { found: false, error: 'No ticket with that ID.' }, ticket: null };
+  if (ticket.status !== 'Pickup Scheduled') {
+    const reason =
+      ticket.status === 'Cancelled'
+        ? 'this return has been cancelled'
+        : ticket.status === 'In Transit'
+          ? 'the pickup has already happened'
+          : 'this return is already complete';
+    return { result: { found: false, error: `Can't reschedule ${ticket.ticketId} — ${reason}.` }, ticket: null };
+  }
+  if (ticket.slot?.slotId === newSlotId) {
+    return { result: { found: true, alreadyThatSlot: true, ticket: { ticketId: ticket.ticketId, slot: ticket.slot } }, ticket: null };
+  }
+  const slot = getPickupSlotsTool(now).find((s) => s.slotId === newSlotId);
+  if (!slot) return { result: { found: false, error: 'Invalid pickup slot.' }, ticket: null };
+
+  const updated: ReturnTicket = { ...ticket, slot };
+  return { result: { found: true, ticket: { ticketId: updated.ticketId, slot } }, ticket: updated };
+}
+
+// ---------------------------------------------------------------------
+// cancelReturnTicket
+// ---------------------------------------------------------------------
+
+export interface CancelReturnTicketResult {
+  found: boolean;
+  error?: string;
+  ticketId?: string;
+}
+
+/**
+ * Only allowed while a ticket is still 'Pickup Scheduled' — once a courier
+ * has actually picked up the item ('In Transit' or later), or the return
+ * is already at a terminal state, there's nothing left to cancel. Each
+ * refusal states why, mirroring the other tools' guards here rather than
+ * a generic "can't do that."
+ */
+export function cancelReturnTicketTool(
+  tickets: ReturnTicket[],
+  authenticatedOrderId: string,
+  ticketId: string,
+): { result: CancelReturnTicketResult; ticket: ReturnTicket | null } {
+  const ticket = tickets.find(
+    (t) => t.ticketId.toUpperCase() === ticketId.trim().toUpperCase() && t.orderId.toUpperCase() === authenticatedOrderId.trim().toUpperCase(),
+  );
+  if (!ticket) return { result: { found: false, error: 'No ticket with that ID.' }, ticket: null };
+
+  if (ticket.status === 'Cancelled') {
+    return { result: { found: false, error: `${ticket.ticketId} is already cancelled.` }, ticket: null };
+  }
+  if (ticket.status !== 'Pickup Scheduled') {
+    const reason = ticket.status === 'In Transit' ? 'the pickup has already happened' : 'this return is already complete';
+    return { result: { found: false, error: `Can't cancel ${ticket.ticketId} — ${reason}.` }, ticket: null };
+  }
+
+  const updated: ReturnTicket = { ...ticket, status: 'Cancelled' };
+  return { result: { found: true, ticketId: updated.ticketId }, ticket: updated };
 }

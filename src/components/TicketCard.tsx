@@ -50,8 +50,13 @@ export function TicketCard({
   // actually run, not just whatever the agent claims in the transcript.
   const showBankLinkStatus = !isExchange && ticket.paymentMethod === 'COD';
 
+  const isCancelled = ticket.status === 'Cancelled';
   const sequence = statusSequenceFor(ticket);
-  const nextStatus = sequence[sequence.indexOf(ticket.status) + 1];
+  // Cancelled is an exit branch, not a pipeline step — it never appears in
+  // statusSequenceFor's sequence, so there's nothing to advance to and
+  // nothing meaningful to show as "progress" (see StatusPipelineCompact's
+  // fallback below).
+  const nextStatus = isCancelled ? undefined : sequence[sequence.indexOf(ticket.status) + 1];
 
   return (
     <div
@@ -82,7 +87,13 @@ export function TicketCard({
         {isExchange ? `Exchange → ${ticket.exchangeSize}` : 'Refund'}
       </span>
 
-      <StatusPipelineCompact status={ticket.status} sequence={sequence} accent={accent} />
+      {isCancelled ? (
+        <span className="inline-flex w-fit items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-semibold text-[#9ca3af]">
+          ✕ Cancelled
+        </span>
+      ) : (
+        <StatusPipelineCompact status={ticket.status} sequence={sequence} accent={accent} />
+      )}
 
       <div className="text-right">
         <p className="truncate text-[11.5px] text-[#4b5563]">{ticket.slot?.label ?? '—'}</p>
