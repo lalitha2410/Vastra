@@ -500,6 +500,29 @@ const PENDING_QUESTION_LABEL: Record<PendingQuestion, string> = {
 };
 
 /**
+ * A loose keyword check that the agent's actual last message plausibly
+ * asked about whatever `facts` says is pending, before validatePendingChoice
+ * or captureNextReply act on that assumption. `currentPendingQuestion` is
+ * derived purely from `facts` — it has no way to know the agent went
+ * off-script (asked something else, or nothing at all) in a given turn.
+ * Seen live: an exchange decline ("no I don't want it") landed while
+ * `facts` still read 'slot' as pending, and — with no check like this one —
+ * got stored as the pickup label verbatim; a ticket could have been
+ * created with that as the pickup time. This doesn't have to be precise,
+ * just enough to catch "the agent clearly wasn't asking about this," since
+ * a false negative here only means a customer's reply goes uncaptured
+ * (the model still sees the raw text and can react to it normally) — never
+ * worse than the blind-capture behavior it replaces.
+ */
+const PENDING_QUESTION_KEYWORDS: Record<PendingQuestion, RegExp> = {
+  item: /item|which one/i,
+  reason: /reason|why/i,
+  exchangeSize: /size/i,
+  slot: /slot|pickup|time/i,
+  rescheduleSlot: /slot|pickup|time/i,
+};
+
+/**
  * The code-level guard the tools themselves can't provide: nothing in
  * llmProvider.ts's tool schema stops the model from picking a
  * plausible-looking option when a customer's numbered reply is out of
@@ -511,12 +534,23 @@ const PENDING_QUESTION_LABEL: Record<PendingQuestion, string> = {
  * — the caller shows a direct rejection and waits for a real answer,
  * exactly like a bounds check in the policy engine would. A prose reply,
  * an in-range number, or nothing pending all fall through untouched.
+ *
+ * `lastAgentText` gates the whole check on PENDING_QUESTION_KEYWORDS: if
+ * the agent's actual last message doesn't look like it asked about
+ * whatever `facts` says is pending, this stays silent rather than
+ * rejecting a numeral that may be answering something else entirely off
+ * the state machine's radar. For 'reason' specifically, a bare numeral
+ * only means anything if the reason menu was actually presented as a
+ * numbered list — see looksLikeFabricatedOptionsList, reused here for
+ * exactly the property it was built to detect.
  */
-function validatePendingChoice(facts: ConversationFacts, incomingMessage: string): string | undefined {
+function validatePendingChoice(facts: ConversationFacts, incomingMessage: string, lastAgentText: string): string | undefined {
   const pending = currentPendingQuestion(facts);
   if (!pending) return undefined;
+  if (!PENDING_QUESTION_KEYWORDS[pending].test(lastAgentText)) return undefined;
   const n = fullNumeral(incomingMessage);
   if (n === null) return undefined;
+  if (pending === 'reason' && !looksLikeFabricatedOptionsList(lastAgentText)) return undefined;
   const count = pendingOptionCount(facts, pending);
   if (count === undefined || (n >= 1 && n <= count)) return undefined;
   const label = PENDING_QUESTION_LABEL[pending];
@@ -553,12 +587,25 @@ function validatePendingChoice(facts: ConversationFacts, incomingMessage: string
  * that's what lets the model reason from the raw constraint text and
  * re-offer alternatives, a real behavior worth keeping; `createReturnTicket`'s
  * handler in updateFacts is the backstop if that ever ends up wrong.
+ *
+ * `lastAgentText` is checked against PENDING_QUESTION_KEYWORDS before any
+ * of this runs — `facts` saying a question is "pending" doesn't mean the
+ * agent's actual last message asked it. Seen live: an exchange decline
+ * ("no I don't want it") landed while 'slot' still read as pending and got
+ * stored as the pickup label verbatim, with nothing to stop a ticket being
+ * created with that as the pickup time — the state-machine-violation
+ * console warning caught the SYMPTOM a few tool calls later, but the wrong
+ * fact had already been sitting in `facts` the whole time. A false
+ * negative here just leaves the fact uncaptured; the model still sees the
+ * customer's actual words in the conversation and can react to them
+ * normally, so skipping a capture is always the safe direction to fail in.
  */
-function captureNextReply(facts: ConversationFacts, incomingMessage: string): void {
+function captureNextReply(facts: ConversationFacts, incomingMessage: string, lastAgentText: string): void {
   const pending = currentPendingQuestion(facts);
   if (!pending) return;
   const trimmed = incomingMessage.trim();
   if (BARE_ACKNOWLEDGEMENTS.has(trimmed.toLowerCase())) return;
+  if (!PENDING_QUESTION_KEYWORDS[pending].test(lastAgentText)) return;
 
   if (pending === 'rescheduleSlot') {
     const n = fullNumeral(trimmed);
@@ -584,12 +631,29 @@ function captureNextReply(facts: ConversationFacts, incomingMessage: string): vo
   }
   if (pending === 'reason') {
     const n = fullNumeral(trimmed);
-    facts.reason = (n && REASON_BY_DIGIT[String(n)]) || trimmed;
+    if (n !== null) {
+      // A bare number only means anything if the menu was actually
+      // numbered (see looksLikeFabricatedOptionsList) — otherwise it's not
+      // a list index, and storing it as literal "reason" text would be
+      // just as wrong as mapping it to the wrong option.
+      if (!looksLikeFabricatedOptionsList(lastAgentText)) return;
+      const mapped = REASON_BY_DIGIT[String(n)];
+      if (!mapped) return; // out of range — validatePendingChoice should already have caught this
+      facts.reason = mapped;
+    } else {
+      facts.reason = trimmed;
+    }
     // Deterministic business rule (see systemPrompt.ts step 4), not a
     // guess about customer intent: only "size" ever goes through the
     // exchange path, so any other reason means the resolution is already
     // known right now, well before getAvailableSizes/getPickupSlots run.
-    if (facts.reason !== 'size') facts.resolution = 'refund';
+    // Checked against the raw reply text, not just the exact enum value —
+    // a prose reason mapped verbatim (the `else` branch above) is whatever
+    // the customer actually typed ("the fit is off, I need a different
+    // size"), which is never literally the string "size" even though it
+    // plainly means one. Locking resolution to "refund" on that mismatch
+    // pre-empted the exchange offer entirely, seen live on VS1002.
+    if (facts.reason !== 'size' && !/size/i.test(trimmed)) facts.resolution = 'refund';
     return;
   }
   if (pending === 'exchangeSize') {
@@ -761,8 +825,37 @@ export function useReturnAgent() {
   const buildExecutors = useCallback(
     (currentBrand: BrandConfig, facts: ConversationFacts): ToolExecutorMap => ({
       lookupOrder: (args) => lookupOrder(currentBrand.catalog, String(args.orderIdOrPhone ?? '')),
-      checkReturnEligibility: (args) =>
-        checkReturnEligibilityTool(currentBrand.catalog, String(args.orderId ?? ''), String(args.itemId ?? '')),
+      checkReturnEligibility: (args) => {
+        const orderId = String(args.orderId ?? '');
+        // The ambiguity check for a multi-item order lives entirely in
+        // lookupOrder's own result (see updateFacts's pendingItemOptions
+        // handling) — which means it only ever runs if lookupOrder was
+        // actually called. Seen live on a vague opener ("return something
+        // from my order VS1002"): the model skipped lookupOrder entirely
+        // and called checkReturnEligibility straight away with a guessed
+        // itemId, so pendingItemOptions was never populated and the
+        // 'item'-pending check below never got a chance to fire at all.
+        // Requiring facts.orderId to already match forces lookupOrder to
+        // run first, every time, which is what actually surfaces the
+        // ambiguity.
+        if (facts.orderId !== orderId) {
+          return {
+            found: false,
+            error: 'You must call lookupOrder for this order first — do not guess which item the customer means.',
+          };
+        }
+        // Backstop for the case lookupOrder DID run and found more than
+        // one item: refuse while 'item' is still genuinely pending, so a
+        // guessed itemId can't slip through even once ambiguity is known.
+        if (currentPendingQuestion(facts) === 'item') {
+          return {
+            found: false,
+            error:
+              'This order has more than one item and the customer has not said which one yet — list the items and ask which one before checking eligibility.',
+          };
+        }
+        return checkReturnEligibilityTool(currentBrand.catalog, String(args.orderId ?? ''), String(args.itemId ?? ''));
+      },
       getAvailableSizes: (args) =>
         getAvailableSizesTool(currentBrand.catalog, String(args.orderId ?? ''), String(args.itemId ?? '')),
       getPickupSlots: () => getPickupSlotsTool(),
@@ -891,6 +984,14 @@ export function useReturnAgent() {
   const [chatStreamingText, setChatStreamingText] = useState('');
   const chatSessionRef = useRef<ChatSession | null>(null);
   const chatFactsRef = useRef<ConversationFacts>({});
+  // Synchronous mirror of chatMessages (React state updates aren't visible
+  // until the next render) — needed so sendChatMessage can read the agent's
+  // actual last line before deciding what the customer's reply answers
+  // (see captureNextReply/validatePendingChoice's lastAgentText parameter).
+  const chatMessagesRef = useRef<ChatMessage[]>([]);
+  useEffect(() => {
+    chatMessagesRef.current = chatMessages;
+  }, [chatMessages]);
 
   if (!chatSessionRef.current && !apiKeyMissing) {
     chatSessionRef.current = newSession(buildSystemInstruction(brand));
@@ -901,12 +1002,17 @@ export function useReturnAgent() {
       const trimmed = text.trim();
       if (!trimmed || apiKeyMissing || !chatSessionRef.current) return undefined;
 
+      // Captured before this turn's own state updates land, so it's
+      // unambiguously the agent's PRIOR line — what the customer's reply
+      // below is actually answering (see PENDING_QUESTION_KEYWORDS).
+      const lastAgentText = [...chatMessagesRef.current].reverse().find((m) => m.role === 'agent')?.text ?? '';
+
       setChatMessages((prev) => [...prev, { id: uid(), role: 'user', text: trimmed, timestamp: Date.now() }]);
 
       // Bounds-checked in code before this ever becomes a model turn — see
       // validatePendingChoice's own comment. No tool call, no LLM request,
       // just an immediate correction while the real question stays open.
-      const rejection = validatePendingChoice(chatFactsRef.current, trimmed);
+      const rejection = validatePendingChoice(chatFactsRef.current, trimmed, lastAgentText);
       if (rejection) {
         setChatMessages((prev) => [...prev, { id: uid(), role: 'agent', text: rejection, timestamp: Date.now() }]);
         return rejection;
@@ -915,7 +1021,7 @@ export function useReturnAgent() {
       setChatIsTyping(true);
       setChatToolActivity(CHAT_THINKING_LABEL);
       setChatStreamingText('');
-      captureNextReply(chatFactsRef.current, trimmed);
+      captureNextReply(chatFactsRef.current, trimmed, lastAgentText);
       try {
         const executors = buildExecutors(brandRef.current, chatFactsRef.current);
         const reply = await sendAgentMessage(
@@ -1051,12 +1157,16 @@ export function useReturnAgent() {
       const trimmed = text.trim();
       if (!trimmed || apiKeyMissing || !voiceSessionRef.current || !callActive) return undefined;
 
+      // See sendChatMessage's identical capture — the agent's PRIOR line,
+      // before this turn's own state updates land.
+      const lastAgentText = [...callMessagesRef.current].reverse().find((m) => m.role === 'agent')?.text ?? '';
+
       setCallMessages((prev) => [...prev, { id: uid(), role: 'user', text: trimmed, timestamp: Date.now() }]);
 
       // Same bounds check as the chat channel — see validatePendingChoice.
       // Spoken immediately rather than routed through the model, same as
       // any other agent line on this channel.
-      const rejection = validatePendingChoice(voiceFactsRef.current, trimmed);
+      const rejection = validatePendingChoice(voiceFactsRef.current, trimmed, lastAgentText);
       if (rejection) {
         setCallMessages((prev) => [...prev, { id: uid(), role: 'agent', text: rejection, timestamp: Date.now() }]);
         speakAgentLine(rejection);
@@ -1066,7 +1176,7 @@ export function useReturnAgent() {
       setIsProcessingVoice(true);
       setVoiceToolActivity(VOICE_THINKING_LABEL);
       setVoiceStreamingText('');
-      captureNextReply(voiceFactsRef.current, trimmed);
+      captureNextReply(voiceFactsRef.current, trimmed, lastAgentText);
       try {
         const executors = buildExecutors(brandRef.current, voiceFactsRef.current);
         const reply = await sendAgentMessage(
