@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { BrandConfig } from '../config/brand';
 import { getBrandById, vastraBrand } from '../config/brand';
-import { seedTicketsFor } from '../data/seedTickets';
+import type { Scenario } from '../data/scenarios';
 import {
   statusSequenceFor,
   type CallLogEntry,
@@ -651,6 +651,43 @@ function factsToSummary(f: ConversationFacts): string {
   return parts.join('. ');
 }
 
+/**
+ * Answers whatever the agent's last reply actually asked, for a scripted
+ * scenario's setup phase (see playScenario) — a real customer completing
+ * this return would answer the question in front of them, not a
+ * pre-guessed one. Order/reason are already stated up front in every
+ * scenario's opener (see scenarios.ts), so a re-ask for either is treated
+ * as the agent needing reassurance, not a genuine information gap.
+ *
+ * The numbered-choice rule matters more than it looks: an earlier version
+ * fell back to prose ("yes, please go ahead") for anything unrecognized,
+ * which reliably derailed the conversation the moment the agent asked a
+ * numbered question this function didn't have a specific rule for (seen
+ * live — a "1️⃣ Replacement 2️⃣ Refund" choice, answered with prose, was
+ * followed by the agent losing track of the order entirely and re-asking
+ * for it). A numbered list only ever expects a number back; "1" is a safe
+ * default first choice for any of them, checked ahead of the generic
+ * fallback but after the more specific slot rule (slot offers are ALSO
+ * numbered, and "1" is correct there too, so order doesn't actually
+ * matter between those two — kept separate for clarity, not behavior).
+ *
+ * `orderId`, when available (see playScenario, which extracts it from the
+ * scenario's own opener), is repeated verbatim rather than a vague "I
+ * already gave it" — also seen live to matter: a vague nudge sometimes
+ * left a provider stuck re-asking the same question every round instead
+ * of recovering.
+ */
+function pickSetupReply(lastAgentText: string, orderId?: string): string {
+  const rules: { matches: RegExp; reply: string }[] = [
+    { matches: /slot|pickup|which time|available time/i, reply: '1' },
+    { matches: /reason|why.*(want|return)|what happened/i, reply: "I've changed my mind, I just don't need it anymore" },
+    { matches: /order id|phone number/i, reply: orderId ? `The order ID is ${orderId}` : 'I gave the order ID already, please check above' },
+    { matches: /1️⃣|2️⃣|3️⃣|4️⃣/, reply: '1' },
+  ];
+  const rule = rules.find((r) => r.matches.test(lastAgentText));
+  return rule ? rule.reply : 'yes, please go ahead';
+}
+
 export function useReturnAgent() {
   const [brand, setBrandState] = useState<BrandConfig>(vastraBrand);
   const [channel, setChannel] = useState<Channel>('whatsapp');
@@ -666,11 +703,13 @@ export function useReturnAgent() {
   // SHARED: one ticket backend, one tool-executor layer, used by both
   // channels' sendAgentMessage calls.
   // ---------------------------------------------------------------------
-  // Seeded from vastraBrand (the initial `brand` state above), not empty —
-  // see seedTicketsFor: several scenarios are about a return already in
-  // progress, which needs to be true from first load, not just after a
-  // Reset (resetAllFor reseeds the same way for whichever brand is active).
-  const [tickets, setTickets] = useState<ReturnTicket[]>(() => seedTicketsFor(vastraBrand));
+  // Genuinely empty on load and after every Reset — nothing pre-seeded.
+  // Scenarios that need an existing return in progress (status lookup,
+  // reschedule, cancel, duplicate-attempt) create their own ticket live,
+  // through the real conversation, as part of the scenario script itself
+  // (see playScenario below and scenarios.ts) — so a visitor never sees a
+  // ticket that wasn't actually produced by something they watched happen.
+  const [tickets, setTickets] = useState<ReturnTicket[]>([]);
   const ticketSeqRef = useRef(0);
   const ticketsRef = useRef<ReturnTicket[]>([]);
   useEffect(() => {
@@ -858,9 +897,9 @@ export function useReturnAgent() {
   }
 
   const sendChatMessage = useCallback(
-    async (text: string) => {
+    async (text: string): Promise<string | undefined> => {
       const trimmed = text.trim();
-      if (!trimmed || apiKeyMissing || !chatSessionRef.current) return;
+      if (!trimmed || apiKeyMissing || !chatSessionRef.current) return undefined;
 
       setChatMessages((prev) => [...prev, { id: uid(), role: 'user', text: trimmed, timestamp: Date.now() }]);
 
@@ -870,7 +909,7 @@ export function useReturnAgent() {
       const rejection = validatePendingChoice(chatFactsRef.current, trimmed);
       if (rejection) {
         setChatMessages((prev) => [...prev, { id: uid(), role: 'agent', text: rejection, timestamp: Date.now() }]);
-        return;
+        return rejection;
       }
 
       setChatIsTyping(true);
@@ -894,6 +933,7 @@ export function useReturnAgent() {
           buildOptionsListGuardrail(chatFactsRef.current),
         );
         setChatMessages((prev) => [...prev, { id: uid(), role: 'agent', text: reply, timestamp: Date.now() }]);
+        return reply;
       } catch (err) {
         const providerName = getActiveProvider().name;
         console.error(`${providerName} request failed`, err);
@@ -902,6 +942,7 @@ export function useReturnAgent() {
           ? "This demo is briefly rate-limited — it clears in about a minute. Hit Reset and try again shortly."
           : "Sorry, I'm having trouble reaching the assistant right now. Please try again in a moment.";
         setChatMessages((prev) => [...prev, { id: uid(), role: 'agent', text: errorText, timestamp: Date.now() }]);
+        return errorText;
       } finally {
         setChatIsTyping(false);
         setChatToolActivity(null);
@@ -1006,9 +1047,9 @@ export function useReturnAgent() {
   }, [tts]);
 
   const sendVoiceMessage = useCallback(
-    async (text: string) => {
+    async (text: string): Promise<string | undefined> => {
       const trimmed = text.trim();
-      if (!trimmed || apiKeyMissing || !voiceSessionRef.current || !callActive) return;
+      if (!trimmed || apiKeyMissing || !voiceSessionRef.current || !callActive) return undefined;
 
       setCallMessages((prev) => [...prev, { id: uid(), role: 'user', text: trimmed, timestamp: Date.now() }]);
 
@@ -1019,7 +1060,7 @@ export function useReturnAgent() {
       if (rejection) {
         setCallMessages((prev) => [...prev, { id: uid(), role: 'agent', text: rejection, timestamp: Date.now() }]);
         speakAgentLine(rejection);
-        return;
+        return rejection;
       }
 
       setIsProcessingVoice(true);
@@ -1044,6 +1085,7 @@ export function useReturnAgent() {
         );
         setCallMessages((prev) => [...prev, { id: uid(), role: 'agent', text: reply, timestamp: Date.now() }]);
         speakAgentLine(reply);
+        return reply;
       } catch (err) {
         const providerName = getActiveProvider().name;
         console.error(`${providerName} request failed`, err);
@@ -1053,6 +1095,7 @@ export function useReturnAgent() {
           : "Sorry, I'm having trouble reaching the assistant right now. Please try again in a moment.";
         setCallMessages((prev) => [...prev, { id: uid(), role: 'agent', text: errorText, timestamp: Date.now() }]);
         speakAgentLine(errorText);
+        return errorText;
       } finally {
         setIsProcessingVoice(false);
         setVoiceToolActivity(null);
@@ -1062,6 +1105,66 @@ export function useReturnAgent() {
       }
     },
     [apiKeyMissing, buildExecutors, callActive, speakAgentLine],
+  );
+
+  /**
+   * Runs a scripted scenario (see data/scenarios.ts) as a sequence of real
+   * customer messages, each awaiting the agent's full reply before the
+   * next is sent — the SAME sendChatMessage/sendVoiceMessage the
+   * customer's own typing goes through, not a shortcut. Several scenarios
+   * are genuinely about a return already in progress (status lookup,
+   * reschedule, cancel, duplicate-attempt), and the only honest way to
+   * get there is to actually create one through the conversation first,
+   * not pre-seed fake ticket data a visitor never saw happen — see the
+   * comment on `tickets`'s initial state above.
+   *
+   * The setup phase (opener → a created ticket) is REACTIVE, not a fixed
+   * script: an early version sent a rigid ["opener", "1"] pair assuming
+   * the agent always goes straight from the opener to a slot choice, and
+   * broke the first time a provider inserted an unexpected "would you
+   * like to proceed?" confirmation — the "1" answered that instead of a
+   * slot, and the conversation derailed. pickSetupReply below answers
+   * whatever was actually asked, the same way a real customer finishing
+   * this return would, capped at a few rounds so a truly stuck
+   * conversation doesn't loop forever.
+   *
+   * `followUp.advanceStatusTimes`, if set, fast-forwards the ticket the
+   * setup just created — the same "Advance (demo)" mechanic a presenter
+   * would click by hand — before `followUp.message` is sent, for
+   * scenarios that need to ask about a return beyond "Pickup Scheduled"
+   * (e.g. genuinely Refunded). The ticket in question is always
+   * `tickets[0]`: tickets are prepended on creation (see buildExecutors'
+   * createReturnTicket), and each scenario runs from a clean slate, so
+   * whatever setup just created is unambiguously the most recent one.
+   */
+  const playScenario = useCallback(
+    async (scenario: Scenario, targetChannel: Channel) => {
+      const send = targetChannel === 'voice' ? sendVoiceMessage : sendChatMessage;
+      const startTicketCount = ticketsRef.current.length;
+      const orderId = scenario.opener.match(/\b(VS|WN)\d{4}\b/)?.[0];
+
+      let lastReply = await send(scenario.opener);
+
+      if (scenario.followUp) {
+        let rounds = 0;
+        while (ticketsRef.current.length === startTicketCount && rounds < 4) {
+          rounds += 1;
+          lastReply = await send(pickSetupReply(lastReply ?? '', orderId));
+        }
+
+        if (scenario.followUp.advanceStatusTimes && ticketsRef.current.length > startTicketCount) {
+          const newTicketId = ticketsRef.current[0]?.ticketId;
+          if (newTicketId) {
+            for (let i = 0; i < scenario.followUp.advanceStatusTimes; i += 1) {
+              advanceTicketStatus(newTicketId);
+            }
+          }
+        }
+
+        await send(scenario.followUp.message);
+      }
+    },
+    [sendChatMessage, sendVoiceMessage, advanceTicketStatus],
   );
 
   const callStatus: CallStatus = tts.isSpeaking ? 'speaking' : isProcessingVoice ? 'thinking' : 'idle';
@@ -1074,7 +1177,7 @@ export function useReturnAgent() {
   const resetAllFor = useCallback(
     (nextBrand: BrandConfig) => {
       ticketSeqRef.current = 0;
-      setTickets(seedTicketsFor(nextBrand));
+      setTickets([]);
 
       setChatMessages([{ id: uid(), role: 'agent', text: chatGreetingFor(nextBrand), timestamp: Date.now() }]);
       setChatToolActivity(null);
@@ -1121,6 +1224,7 @@ export function useReturnAgent() {
     stats,
     apiKeyMissing,
     reset,
+    playScenario,
     chat: {
       messages: chatMessages,
       isTyping: chatIsTyping,

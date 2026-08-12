@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { BrandConfig } from '../config/brand';
 import type { ChatMessage } from '../types';
-import { getScenarios } from '../data/scenarios';
+import { getScenarios, type Scenario } from '../data/scenarios';
 import { getActiveProvider } from '../lib/llmProvider';
 import { ChatBubble, StreamingBubble, TypingIndicator } from './ChatBubble';
 
@@ -40,9 +40,10 @@ interface ChatPanelProps {
   streamingText: string;
   disabled: boolean;
   onSend: (text: string) => void;
+  onPlayScenario: (scenario: Scenario) => void;
 }
 
-export function ChatPanel({ brand, messages, isTyping, streamingText, disabled, onSend }: ChatPanelProps) {
+export function ChatPanel({ brand, messages, isTyping, streamingText, disabled, onSend, onPlayScenario }: ChatPanelProps) {
   const [draft, setDraft] = useState('');
   const [scenarioOpen, setScenarioOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -94,10 +95,10 @@ export function ChatPanel({ brand, messages, isTyping, streamingText, disabled, 
                 <button
                   key={s.id}
                   type="button"
-                  disabled={disabled}
+                  disabled={disabled || isTyping}
                   onClick={() => {
                     setScenarioOpen(false);
-                    submit(s.message);
+                    onPlayScenario(s);
                   }}
                   className="block w-full px-3 py-1.5 text-left text-[12.5px] text-[#111b21] hover:bg-[#f5f6f6] disabled:opacity-50"
                 >

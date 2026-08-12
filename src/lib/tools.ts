@@ -75,8 +75,23 @@ export interface CheckEligibilityToolResult {
   returnWindowDays?: number;
   daysRemaining?: number;
   finalSale?: boolean;
+  requiresPrescription?: boolean;
+  /** True if this item can only be returned unopened/sealed — reported
+   * here (before a reason is even known) so the model can proactively ask
+   * whether the item is still sealed once "changed my mind" comes up,
+   * instead of only discovering the rule from a refusal. See
+   * checkEligibility's own doc in policy.ts for why this can't be
+   * enforced yet at this step. */
+  sealedOnly?: boolean;
   itemName?: string;
   price?: number;
+  /** Sizes this item could exchange into — surfaced here too (not just
+   * from getAvailableSizes) so the model already knows, from step 2 of
+   * the flow, whether this item has size variants at all. An empty array
+   * on a quality/not-as-described complaint is what tells the resolution
+   * step this is a device/accessory (offer a straight replacement) rather
+   * than a garment (only "size" reason offers an exchange). */
+  availableSizes?: string[];
 }
 
 export function checkReturnEligibilityTool(
@@ -92,6 +107,7 @@ export function checkReturnEligibilityTool(
     ...result,
     itemName: match.item.name,
     price: match.item.price,
+    availableSizes: match.item.availableSizes,
   };
 }
 
@@ -143,6 +159,10 @@ export interface CreateReturnTicketInput {
   resolution: Resolution;
   slotId: string;
   exchangeSize?: string;
+  /** Only meaningful for a sealed-only item with reason "changed_mind" —
+   * see checkEligibility in policy.ts. Omit for anything else; the
+   * eligibility re-check below only looks at it in that one combination. */
+  itemCondition?: 'sealed' | 'opened';
 }
 
 export interface CreateReturnTicketResult {
@@ -199,7 +219,7 @@ export function createReturnTicketTool(
     };
   }
 
-  const eligibility = checkEligibility(match.order, match.item, new Date(now));
+  const eligibility = checkEligibility(match.order, match.item, new Date(now), input.reason, input.itemCondition);
   if (!eligibility.eligible) {
     return { found: false, error: `Not eligible: ${eligibility.reasons.join(' ')}` };
   }

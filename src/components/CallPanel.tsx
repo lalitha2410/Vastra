@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { BrandConfig } from '../config/brand';
 import type { CallStatus, TranscriptEntry } from '../types';
-import { getScenarios } from '../data/scenarios';
+import { getScenarios, type Scenario } from '../data/scenarios';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 import { MicButton } from './MicButton';
 
@@ -16,6 +16,7 @@ interface CallPanelProps {
   ttsSupported: boolean;
   apiKeyMissing: boolean;
   onSend: (text: string) => void;
+  onPlayScenario: (scenario: Scenario) => void;
   onStartCall: () => void;
   onEndCall: () => void;
 }
@@ -55,6 +56,7 @@ export function CallPanel({
   ttsSupported,
   apiKeyMissing,
   onSend,
+  onPlayScenario,
   onStartCall,
   onEndCall,
 }: CallPanelProps) {
@@ -238,7 +240,7 @@ export function CallPanel({
                   key={s.id}
                   type="button"
                   disabled={busy || apiKeyMissing}
-                  onClick={() => submit(s.message)}
+                  onClick={() => onPlayScenario(s)}
                   className="rounded-full border border-white/15 bg-white/5 px-2.5 py-1 text-[11px] font-medium text-white/80 hover:bg-white/10 disabled:opacity-40"
                 >
                   {s.label}

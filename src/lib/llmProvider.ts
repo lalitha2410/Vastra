@@ -369,12 +369,19 @@ const toolDeclarations: ToolDeclaration[] = [
           resolution: {
             type: 'string',
             enum: ['exchange', 'refund'],
-            description: "exchange for a size swap, refund otherwise.",
+            description:
+              '"exchange" for a size swap OR a straight replacement unit (same item, no size involved — for a faulty device/accessory with no size variants); "refund" otherwise.',
           },
           slotId: { type: 'string', description: 'The chosen pickup slot ID, e.g. "slot-1".' },
           exchangeSize: {
             type: 'string',
-            description: 'The new size chosen, only when resolution is "exchange".',
+            description: 'The new size chosen, only when resolution is "exchange" AND the item has size variants. Omit for a straight replacement (no size variants).',
+          },
+          itemCondition: {
+            type: 'string',
+            enum: ['sealed', 'opened'],
+            description:
+              'Only ask for and pass this when checkReturnEligibility flagged the item as sealedOnly AND reason is "changed_mind" — whether the customer says it\'s still sealed/unopened or already opened. Omit in every other case.',
           },
         },
         required: ['orderId', 'itemId', 'reason', 'resolution', 'slotId'],
@@ -511,8 +518,17 @@ const RECENT_MESSAGE_WINDOW = 6;
  * `assistant` tool_calls, which every OpenAI-compatible API rejects.
  * Each turn's tool round trip is fully contained between one `user`
  * message and the next, so walking forward from the naive cutoff to the
- * next `user` message is always safe and never discards more than
- * necessary.
+ * next `user` message is usually enough — EXCEPT when the current turn's
+ * own tool-call chain is long enough (3+ round trips — a real scripted
+ * scenario hit this) that it alone exceeds RECENT_MESSAGE_WINDOW, in
+ * which case there's no `user` message left to walk forward to at all,
+ * and the forward search runs off the end into an EMPTY slice. Every
+ * OpenAI-compatible provider tolerates that (a slightly bare request, but
+ * not a broken one); Gemini's API rejects a `contents: []` request
+ * outright (400 "contents is not specified"), which is exactly what
+ * exposed this. Falling back to walking BACKWARD from the naive cutoff in
+ * that case always lands on the start of the current, still-in-progress
+ * user turn — longer than the usual budget, but never empty.
  *
  * The summary is deliberately opaque here — this module has no idea what
  * "order ID" or "reason" mean, and shouldn't (see the file-level comment).
@@ -522,8 +538,13 @@ const RECENT_MESSAGE_WINDOW = 6;
  */
 function buildRequestMessages(fullHistory: ChatCompletionMessage[], contextSummary?: string): ChatCompletionMessage[] {
   const [systemMsg, ...rest] = fullHistory;
-  let cutoff = Math.max(0, rest.length - RECENT_MESSAGE_WINDOW);
+  const naiveCutoff = Math.max(0, rest.length - RECENT_MESSAGE_WINDOW);
+  let cutoff = naiveCutoff;
   while (cutoff < rest.length && rest[cutoff].role !== 'user') cutoff += 1;
+  if (cutoff >= rest.length) {
+    cutoff = naiveCutoff;
+    while (cutoff > 0 && rest[cutoff].role !== 'user') cutoff -= 1;
+  }
   const recent = rest.slice(cutoff);
 
   if (!contextSummary) return [systemMsg, ...recent];

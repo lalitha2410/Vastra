@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useReturnAgent } from './hooks/useReturnAgent';
 import { TopBar } from './components/TopBar';
 import { ChatPanel } from './components/ChatPanel';
@@ -9,11 +9,27 @@ import { SplitView } from './components/SplitView';
 import { IntroOverlay } from './components/IntroOverlay';
 
 function App() {
-  const { brand, setBrand, channel, setChannel, tickets, advanceTicketStatus, stats, apiKeyMissing, reset, chat, voice } =
-    useReturnAgent();
+  const {
+    brand,
+    setBrand,
+    channel,
+    setChannel,
+    tickets,
+    advanceTicketStatus,
+    stats,
+    apiKeyMissing,
+    reset,
+    playScenario,
+    chat,
+    voice,
+  } = useReturnAgent();
   // Deliberately not part of useReturnAgent's state — Reset should never
   // bring this back mid-demo, only a fresh page load should.
   const [showIntro, setShowIntro] = useState(true);
+
+  useEffect(() => {
+    document.title = `${brand.name} — Returns Assistant`;
+  }, [brand.name]);
 
   return (
     <div className="flex h-screen min-h-0 flex-col bg-[#f6f7f8]">
@@ -39,6 +55,7 @@ function App() {
               ttsSupported={voice.ttsSupported}
               apiKeyMissing={apiKeyMissing}
               onSend={voice.sendMessage}
+              onPlayScenario={(scenario) => playScenario(scenario, 'voice')}
               onStartCall={voice.startCall}
               onEndCall={voice.endCall}
             />
@@ -50,6 +67,7 @@ function App() {
               streamingText={chat.streamingText}
               disabled={apiKeyMissing}
               onSend={chat.sendMessage}
+              onPlayScenario={(scenario) => playScenario(scenario, 'whatsapp')}
             />
           )
         }

@@ -84,7 +84,7 @@ export function TicketCard({
             : { backgroundColor: '#F3F4F6', color: '#4B5563' }
         }
       >
-        {isExchange ? `Exchange → ${ticket.exchangeSize}` : 'Refund'}
+        {isExchange ? (ticket.exchangeSize ? `Exchange → ${ticket.exchangeSize}` : 'Exchange → replacement') : 'Refund'}
       </span>
 
       {isCancelled ? (

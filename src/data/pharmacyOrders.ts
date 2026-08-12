@@ -11,13 +11,17 @@ function img(label: string, bg = 'EAF1EE', fg = '17332B'): string {
 }
 
 /**
- * ~10 realistic WellNest Pharmacy orders — second brand config to prove the
- * demo re-skins cleanly. Return window is intentionally short (2 days) and
- * most medicines are final-sale, per real pharmacy return regulation norms.
+ * ~10 realistic WellNest Pharmacy orders — second brand config, deliberately
+ * NOT a fashion reskin: real pharmacy return policy is genuinely stricter
+ * (see the requiresPrescription/sealedOnly rules in policy.ts), so this
+ * catalog encodes that difference in the data, not just item names.
  *  - WN2004: delivered 6 days ago -> outside the 2-day window
- *  - WN2002: contains a final-sale prescription item
+ *  - WN2002: prescription medicine -> hard-refused, not just "final sale"
  *  - WN2001: multi-item order
  *  - WN2006: COD order
+ *  - WN2005, WN2010: sealed-only hygiene consumables — a "changed mind"
+ *    return only holds if still sealed (see scenarios.ts's paired
+ *    "sealed → OK" / "opened → refused" scenarios)
  */
 export const pharmacyOrders: Order[] = [
   {
@@ -46,7 +50,8 @@ export const pharmacyOrders: Order[] = [
         colour: '-',
         price: 349,
         imageUrl: img('Vitamin D3'),
-        finalSale: true,
+        finalSale: false,
+        sealedOnly: true,
         availableSizes: [],
       },
     ],
@@ -68,6 +73,7 @@ export const pharmacyOrders: Order[] = [
         price: 89,
         imageUrl: img('Amoxicillin'),
         finalSale: true,
+        requiresPrescription: true,
         availableSizes: [],
       },
     ],
@@ -131,6 +137,7 @@ export const pharmacyOrders: Order[] = [
         price: 499,
         imageUrl: img('N95 Masks'),
         finalSale: false,
+        sealedOnly: true,
         availableSizes: ['Box of 10', 'Box of 50'],
       },
     ],
@@ -193,7 +200,7 @@ export const pharmacyOrders: Order[] = [
         colour: '-',
         price: 599,
         imageUrl: img('Multivitamin'),
-        finalSale: true,
+        finalSale: false,
         availableSizes: [],
       },
     ],
@@ -236,6 +243,7 @@ export const pharmacyOrders: Order[] = [
         price: 899,
         imageUrl: img('Sunscreen'),
         finalSale: false,
+        sealedOnly: true,
         availableSizes: [],
       },
     ],

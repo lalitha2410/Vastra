@@ -12,6 +12,20 @@ export interface OrderItem {
   finalSale: boolean;
   /** Sizes this item could be exchanged into (excludes current size). */
   availableSizes: string[];
+  /** Prescription medicines can't be returned once dispensed, full stop —
+   * a hard, unconditional refusal, independent of window/reason/anything
+   * else. Distinct from `finalSale` (a merchandising decision) because the
+   * refusal reason a customer hears should be the real one: regulation,
+   * not "we don't take these back." Never set on non-pharmacy items. */
+  requiresPrescription?: boolean;
+  /** A "changed my mind" return only holds if the item is still sealed —
+   * real policy for hygiene-sensitive consumables (masks, supplements,
+   * anything ingested/worn against skin). A defect/quality complaint is
+   * NOT gated by this — you can return a broken sealed-only item whether
+   * or not you opened it to discover the defect; only changed_mind cares
+   * whether the seal is intact. See checkEligibility's itemCondition
+   * parameter. Never set on non-pharmacy items. */
+  sealedOnly?: boolean;
 }
 
 export interface Order {
