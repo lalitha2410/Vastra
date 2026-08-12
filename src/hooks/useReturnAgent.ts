@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { BrandConfig } from '../config/brand';
 import { getBrandById, vastraBrand } from '../config/brand';
+import { seedTicketsFor } from '../data/seedTickets';
 import {
   statusSequenceFor,
   type CallLogEntry,
@@ -665,7 +666,11 @@ export function useReturnAgent() {
   // SHARED: one ticket backend, one tool-executor layer, used by both
   // channels' sendAgentMessage calls.
   // ---------------------------------------------------------------------
-  const [tickets, setTickets] = useState<ReturnTicket[]>([]);
+  // Seeded from vastraBrand (the initial `brand` state above), not empty —
+  // see seedTicketsFor: several scenarios are about a return already in
+  // progress, which needs to be true from first load, not just after a
+  // Reset (resetAllFor reseeds the same way for whichever brand is active).
+  const [tickets, setTickets] = useState<ReturnTicket[]>(() => seedTicketsFor(vastraBrand));
   const ticketSeqRef = useRef(0);
   const ticketsRef = useRef<ReturnTicket[]>([]);
   useEffect(() => {
@@ -1069,7 +1074,7 @@ export function useReturnAgent() {
   const resetAllFor = useCallback(
     (nextBrand: BrandConfig) => {
       ticketSeqRef.current = 0;
-      setTickets([]);
+      setTickets(seedTicketsFor(nextBrand));
 
       setChatMessages([{ id: uid(), role: 'agent', text: chatGreetingFor(nextBrand), timestamp: Date.now() }]);
       setChatToolActivity(null);

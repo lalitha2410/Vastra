@@ -5,6 +5,34 @@ import { getScenarios } from '../data/scenarios';
 import { getActiveProvider } from '../lib/llmProvider';
 import { ChatBubble, StreamingBubble, TypingIndicator } from './ChatBubble';
 
+/**
+ * WhatsApp Business verified-badge convention — on WhatsApp Business the
+ * customer is messaging the BRAND's account, so the thread header shows
+ * the business name with a scalloped verified seal (see e.g. LimeChat's
+ * own demos, which show "Mahindra Auto ✓", or the classic Twitter/Meta
+ * verified badge this shape borrows from), never the agent's name or a
+ * paraphrase like "Riya · Vastra Returns". Blue rather than the brand's
+ * own accent deliberately: this needs to read as "a genuine WhatsApp
+ * Business badge," not a custom brand touch.
+ *
+ * The scalloped outline (not a plain circle) is what actually reads as
+ * "verified seal" rather than just "blue dot" — three 14×14 rounded
+ * squares layered 30° apart give 12 evenly-spaced points, the same
+ * overlapping-square construction real verified badges use.
+ */
+function VerifiedBadge() {
+  return (
+    <svg viewBox="0 0 20 20" width="14" height="14" className="shrink-0" aria-label="Verified business account">
+      <g fill="#55ACEE">
+        <rect x="3" y="3" width="14" height="14" rx="4" />
+        <rect x="3" y="3" width="14" height="14" rx="4" transform="rotate(30 10 10)" />
+        <rect x="3" y="3" width="14" height="14" rx="4" transform="rotate(60 10 10)" />
+      </g>
+      <path d="M6.2 10.3 8.7 12.8 13.8 7.5" fill="none" stroke="white" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 interface ChatPanelProps {
   brand: BrandConfig;
   messages: ChatMessage[];
@@ -39,15 +67,17 @@ export function ChatPanel({ brand, messages, isTyping, streamingText, disabled, 
           className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[15px] font-semibold text-white"
           style={{ backgroundColor: brand.colors.primary }}
         >
-          {brand.agentName.charAt(0)}
+          {brand.logoMark}
         </div>
+        {/* This is the customer's view of a WhatsApp Business thread —
+            they're messaging the BRAND's account, so the header identifies
+            the business, not the agent handling this particular chat. */}
         <div className="min-w-0 flex-1">
-          <p className="truncate text-[14.5px] font-medium leading-tight text-[#111b21]">
-            {brand.agentName} · {brand.name} Returns
-          </p>
-          <p className="truncate text-[12px] leading-tight text-[#667781]">
-            {isTyping ? 'typing…' : `${brand.waNumber} · online`}
-          </p>
+          <div className="flex min-w-0 items-center gap-1">
+            <p className="truncate text-[14.5px] font-medium leading-tight text-[#111b21]">{brand.name}</p>
+            <VerifiedBadge />
+          </div>
+          <p className="truncate text-[12px] leading-tight text-[#667781]">{isTyping ? 'typing…' : 'Business account'}</p>
         </div>
 
         <div className="relative">
