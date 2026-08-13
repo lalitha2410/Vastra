@@ -9,12 +9,15 @@ interface SplitViewProps {
 }
 
 /**
- * Chosen responsive approach: a tab switcher below `md` (768px), not a
- * shrunk side-by-side split and not a swipeable sheet. Below `md` each
- * panel gets the full viewport width when active — the 50/50 split is
- * never compressed into two unreadable slivers. Both panels stay mounted
- * (hidden, not unmounted) so switching tabs doesn't lose chat scroll
- * position, an in-progress draft, or an active SpeechRecognition session.
+ * Fixed 35/65 split above `md` (768px), chat/ops — matches the cart-
+ * recovery demo's proportions rather than an even split. The chat/call
+ * panel only ever needs to fit narrow WhatsApp bubbles or a call
+ * transcript; the ops console carries a table plus ticket cards — it's the
+ * side that actually needs the room. The split is never allowed to shrink
+ * into two unreadable slivers below `md`, where the active panel goes full
+ * width via a tab switcher instead. Both panels stay mounted (hidden, not
+ * unmounted) so switching tabs doesn't lose chat scroll position, an
+ * in-progress draft, or an active SpeechRecognition session.
  *
  * The left tab's label follows `channel` (💬 Chat / 📞 Call) since it's
  * literally a different panel depending which channel is active — this is
@@ -30,7 +33,7 @@ export function SplitView({ accent, channel, left, ops }: SplitViewProps) {
     }`;
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col md:grid md:grid-cols-[1fr_1.3fr]">
+    <div className="flex min-h-0 flex-1 flex-col md:grid md:grid-cols-[35fr_65fr]">
       <div className="flex border-b border-[#e2e4e8] bg-white md:hidden">
         <button
           type="button"

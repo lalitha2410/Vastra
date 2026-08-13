@@ -523,6 +523,28 @@ const PENDING_QUESTION_KEYWORDS: Record<PendingQuestion, RegExp> = {
 };
 
 /**
+ * Overrides a PENDING_QUESTION_KEYWORDS match, rather than being folded
+ * into it — a keyword match alone isn't enough. Seen live on a weak
+ * fallback model (OpenRouter's free tier): a confused, compound reply like
+ * "I need to know why you're returning it — but first, could you share
+ * your order ID or the phone number?" contains "why", so it passed the
+ * 'reason' keyword check even though the customer's next reply ("the
+ * order ID is VS1014") was answering the SECOND half of that message, not
+ * the first. That's exactly how a return reason ended up captured as the
+ * literal string "The order ID is VS1014". Re-identification is always
+ * off-script here — order/item identification is supposed to already be
+ * resolved before 'item', 'reason', 'exchangeSize', 'slot', or
+ * 'rescheduleSlot' can even become pending (see FLOW) — so this pattern
+ * unconditionally blocks a capture regardless of which keyword also
+ * matched. Matches the specific "order ID or phone number" phrasing this
+ * app's own prompts consistently produce for that question (see
+ * systemPrompt.ts/voiceSystemPrompt.ts step 1), not a bare mention of
+ * "order" alone, which a legitimate confirmation recap ("order VS1014
+ * confirmed, why are you returning it?") would otherwise trip.
+ */
+const ORDER_ID_REASK_PATTERN = /order id.{0,25}phone number/i;
+
+/**
  * The code-level guard the tools themselves can't provide: nothing in
  * llmProvider.ts's tool schema stops the model from picking a
  * plausible-looking option when a customer's numbered reply is out of
@@ -547,7 +569,7 @@ const PENDING_QUESTION_KEYWORDS: Record<PendingQuestion, RegExp> = {
 function validatePendingChoice(facts: ConversationFacts, incomingMessage: string, lastAgentText: string): string | undefined {
   const pending = currentPendingQuestion(facts);
   if (!pending) return undefined;
-  if (!PENDING_QUESTION_KEYWORDS[pending].test(lastAgentText)) return undefined;
+  if (!PENDING_QUESTION_KEYWORDS[pending].test(lastAgentText) || ORDER_ID_REASK_PATTERN.test(lastAgentText)) return undefined;
   const n = fullNumeral(incomingMessage);
   if (n === null) return undefined;
   if (pending === 'reason' && !looksLikeFabricatedOptionsList(lastAgentText)) return undefined;
@@ -605,7 +627,7 @@ function captureNextReply(facts: ConversationFacts, incomingMessage: string, las
   if (!pending) return;
   const trimmed = incomingMessage.trim();
   if (BARE_ACKNOWLEDGEMENTS.has(trimmed.toLowerCase())) return;
-  if (!PENDING_QUESTION_KEYWORDS[pending].test(lastAgentText)) return;
+  if (!PENDING_QUESTION_KEYWORDS[pending].test(lastAgentText) || ORDER_ID_REASK_PATTERN.test(lastAgentText)) return;
 
   if (pending === 'rescheduleSlot') {
     const n = fullNumeral(trimmed);
