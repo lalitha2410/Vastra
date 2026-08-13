@@ -28,11 +28,22 @@ export interface Scenario {
  * Scripted openers (and, for a handful, a reactive follow-up — see
  * Scenario's own doc) for "Play scenario" — lets a live demo run without
  * typing. Each brand's list reflects what's actually realistic for that
- * vertical, not a reskin of the other's: WellNest's list has no "exchange
- * for a different size" scenario for a device, and encodes pharmacy-
+ * vertical, not a reskin of the other's: WellNest encodes pharmacy-
  * specific concepts (damaged in transit, near-expiry stock, sealed-only
  * hygiene items, prescription refusal, device replacement) that simply
- * don't exist in Vastra's list at all.
+ * don't exist in Vastra's list at all, and Vastra's fashion catalog has no
+ * `sealedOnly`/`requiresPrescription` items at all — those concepts can't
+ * leak in even by accident. The one scenario category both lists share,
+ * `size_exchange`, isn't a reskin either: it's a genuinely plausible size
+ * exchange in both catalogs (a kurta for Vastra, an orthopedic knee
+ * support with real M/L/XL variants for WellNest) — but since the
+ * dropdown only ever renders `label` (see ChatPanel/CallPanel), never the
+ * opener, a label reused verbatim across brands reads as an apparel
+ * leftover even when the underlying item isn't one. WellNest's label spells
+ * out "(knee support)" for exactly that reason — the other shared labels
+ * (multi-item, refund, reschedule, cancel, duplicate attempt) describe a
+ * generic retail mechanic, not a vertical, so they don't have this problem
+ * and are left as plain shared text.
  *
  * Nothing here pre-seeds ticket data — every ticket a scenario needs is
  * created live, through the same conversation a customer would have, the
@@ -138,7 +149,7 @@ const scenariosByBrand: Record<string, Scenario[]> = {
   wellnest: [
     {
       id: 'size_exchange',
-      label: 'Size issue → exchange',
+      label: 'Size issue → exchange (knee support)',
       opener:
         'Hi, I ordered order WN2007 but the knee support is too loose on me — could I exchange it for a smaller size?',
     },
