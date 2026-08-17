@@ -639,16 +639,44 @@ function captureNextReply(facts: ConversationFacts, incomingMessage: string, las
   if (pending === 'item') {
     const n = fullNumeral(trimmed);
     const options = facts.pendingItemOptions;
-    const matched = n && options ? options[n - 1] : undefined;
+    let matched = n && options ? options[n - 1] : undefined;
+    // A prose reply ("the BP monitor", "the digital one") used to be left
+    // entirely uncaptured here, on the theory that checkReturnEligibility's
+    // own itemId argument would resolve it instead once the model correctly
+    // parsed which item was meant. That theory was wrong: buildExecutors'
+    // checkReturnEligibility backstop refuses EVERY call while
+    // currentPendingQuestion still reads 'item' — which it does for as long
+    // as facts.itemId is unset — so a model that correctly identifies the
+    // item from prose has no path to ever set facts.itemId at all. Confirmed
+    // live on WellNest's damaged-BP-monitor case (a genuinely multi-item
+    // order, WN2001): the model kept re-guessing the right itemId every
+    // turn and kept getting refused by its own conversation's state, an
+    // infinite loop the customer can't get out of no matter what they type.
+    // Resolved here the same way a human reading the reply would: does it
+    // name exactly one candidate uniquely? Matched on whole distinctive
+    // words from each candidate's own name (length > 2, so "BP"/"of"-style
+    // noise can't false-match) — if more than one candidate's words show up,
+    // or none do, this stays unresolved rather than guess, same principle
+    // as every other "don't guess" capture in this function.
+    if (!matched && options) {
+      const lower = trimmed.toLowerCase();
+      const nameMatches = options.filter((o) =>
+        o.name
+          .toLowerCase()
+          .split(/\W+/)
+          .filter((w) => w.length > 2)
+          .some((word) => lower.includes(word)),
+      );
+      if (nameMatches.length === 1) matched = nameMatches[0];
+    }
     if (matched) {
       facts.itemId = matched.itemId;
       facts.itemName = matched.name;
       facts.pendingItemOptions = undefined;
     }
-    // No match (prose, e.g. "the jeans"): deliberately leave everything
-    // as-is. itemId stays unset, so currentPendingQuestion keeps
-    // returning 'item' until checkReturnEligibility's own itemId argument
-    // resolves it — no guessing at which item prose text refers to.
+    // Still no match (too vague, or ambiguous between candidates):
+    // deliberately leave everything as-is and let the model ask again —
+    // no guessing at which item unclear prose refers to.
     return;
   }
   if (pending === 'reason') {
@@ -665,17 +693,25 @@ function captureNextReply(facts: ConversationFacts, incomingMessage: string, las
     } else {
       facts.reason = trimmed;
     }
-    // Deterministic business rule (see systemPrompt.ts step 4), not a
-    // guess about customer intent: only "size" ever goes through the
-    // exchange path, so any other reason means the resolution is already
-    // known right now, well before getAvailableSizes/getPickupSlots run.
-    // Checked against the raw reply text, not just the exact enum value —
-    // a prose reason mapped verbatim (the `else` branch above) is whatever
-    // the customer actually typed ("the fit is off, I need a different
-    // size"), which is never literally the string "size" even though it
-    // plainly means one. Locking resolution to "refund" on that mismatch
-    // pre-empted the exchange offer entirely, seen live on VS1002.
-    if (facts.reason !== 'size' && !/size/i.test(trimmed)) facts.resolution = 'refund';
+    // Deliberately NOT forcing facts.resolution here. This used to lock it
+    // to 'refund' the instant any non-"size" reason was captured, back when
+    // "size" was the only reason that could ever lead to an exchange. That
+    // stopped being true once systemPrompt.ts step 4 grew a second exchange
+    // path — a straight replacement, offered first for a "quality" or
+    // "not_as_described" reason on an item with no size variants (a device,
+    // not sized apparel) — and this line was never updated to match. The bug
+    // that produced: factsToSummary (below) puts "resolution: refund"
+    // straight into the next request as an already-established fact the
+    // instant a customer typed anything defect-like ("arrived with a
+    // cracked screen"), so the model saw a refund already decided before it
+    // ever got to the replacement-first instruction — confirmed live on
+    // WellNest's damaged-BP-monitor case, where the customer explicitly
+    // said "I'd like a replacement, not a refund" and still got a refund.
+    // resolution is authoritative from exactly two places now: the
+    // 'exchangeSize' branch below (a real size choice), and
+    // createReturnTicket's own result in updateFacts (whatever the model
+    // actually booked) — both fire well after the model has had a real
+    // chance to decide, unlike this one did.
     return;
   }
   if (pending === 'exchangeSize') {

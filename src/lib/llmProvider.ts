@@ -432,8 +432,22 @@ interface StreamResult {
 
 /** How many non-system messages to send verbatim — enough to cover the
  * customer's most recent answer plus the immediately preceding tool round
- * trip, everything older is represented by the caller's summary instead. */
-const RECENT_MESSAGE_WINDOW = 6;
+ * trip, everything older is represented by the caller's summary instead.
+ * Was 6 until a live WellNest run (a multi-item order, WN2001) showed that's
+ * too tight: a SINGLE turn can burn through 6 all by itself — lookupOrder's
+ * tool_call + result, a guessed-itemId checkReturnEligibility call that gets
+ * refused by the ambiguity backstop (see buildExecutors), its error result,
+ * then the final text asking which item, is already 5 messages on top of
+ * the user message that started it. The next customer reply then walks the
+ * forward-to-next-`user`-boundary cutoff below (see buildRequestMessages)
+ * all the way to itself, sending the model NOTHING but that one bare
+ * message — no lookupOrder call, no order data, nothing — with only the
+ * one-line summary standing in for an entire turn's context. Confirmed live:
+ * the model, given that thin a request, didn't trust/use the summary and
+ * re-asked for the order ID/phone from scratch, discarding a real answer
+ * the customer had just given. 14 gives headroom for roughly two such
+ * multi-tool-call turns before the summary has to carry the load alone. */
+const RECENT_MESSAGE_WINDOW = 14;
 
 /**
  * Builds what actually gets sent over the wire: the system prompt, an
