@@ -482,7 +482,11 @@ const RECENT_MESSAGE_WINDOW = 14;
  * message; the returns-domain logic that builds it lives entirely in
  * useReturnAgent.ts.
  */
-function buildRequestMessages(fullHistory: ChatCompletionMessage[], contextSummary?: string): ChatCompletionMessage[] {
+function buildRequestMessages(
+  fullHistory: ChatCompletionMessage[],
+  contextSummary?: string,
+  extraNote?: string,
+): ChatCompletionMessage[] {
   const [systemMsg, ...rest] = fullHistory;
   const naiveCutoff = Math.max(0, rest.length - RECENT_MESSAGE_WINDOW);
   let cutoff = naiveCutoff;
@@ -493,12 +497,20 @@ function buildRequestMessages(fullHistory: ChatCompletionMessage[], contextSumma
   }
   const recent = rest.slice(cutoff);
 
-  if (!contextSummary) return [systemMsg, ...recent];
-  const summaryMsg: ChatCompletionMessage = {
-    role: 'system',
-    content: `Context established earlier in this conversation (do not re-ask for these): ${contextSummary}`,
-  };
-  return [systemMsg, summaryMsg, ...recent];
+  const leading: ChatCompletionMessage[] = [systemMsg];
+  if (contextSummary) {
+    leading.push({
+      role: 'system',
+      content: `Context established earlier in this conversation (do not re-ask for these): ${contextSummary}`,
+    });
+  }
+  // One-shot, never persisted to `chat.messages` — see sendAgentMessage's
+  // formatGuardrail doc. Appended last so it's the most recent instruction
+  // the model sees, right before the message list it's correcting.
+  if (extraNote) {
+    leading.push({ role: 'system', content: extraNote });
+  }
+  return [...leading, ...recent];
 }
 
 /** Matches the same rate-limit/quota wording useReturnAgent.ts's own
@@ -811,6 +823,31 @@ async function streamChatCompletion(
  * UX cost is that this specific reply appears all at once instead of
  * streaming token-by-token. Every trigger is logged with which provider
  * needed correcting, so a pattern by provider is visible over time.
+ *
+ * `formatGuardrail`, if given, enforces an OUTPUT-FORMATTING rule rather
+ * than a tool-use one — e.g. "an options list must be numbered." Unlike
+ * `guardrail` above (checked once, only against the turn's very first
+ * reply), this has to be re-checked on WHATEVER reply in this turn turns
+ * out to be the final text one: a list-backed question (which item, the
+ * return reason, which size, which slot) routinely becomes pending only
+ * partway through a turn's own tool calls — e.g. the reason menu doesn't
+ * exist to get the formatting right or wrong until AFTER
+ * checkReturnEligibility has already run this same turn — so a check
+ * scoped to the first reply the way `guardrail` is would structurally
+ * always miss it. `shouldArm()` is called fresh at the top of every loop
+ * iteration (never pre-computed once) so it sees facts as they stand after
+ * whatever tool calls this turn has made so far, and decides whether
+ * THIS attempt's text needs to be buffered rather than streamed live —
+ * buffering costs nothing when `shouldArm()` says no, which is most
+ * iterations of most turns; it only gets expensive (loses live token
+ * streaming for that one reply) on the specific attempt that might need
+ * correcting. `check(content)` runs once that attempt's full text is in
+ * and returns a corrective instruction to retry with (injected as a
+ * one-shot system message via buildRequestMessages' `extraNote` — never
+ * persisted to `chat.messages`, so it can't linger and skew later turns)
+ * or undefined if the formatting's fine. Capped at one retry for the whole
+ * call, same one-shot principle as `guardrail`, so a stubborn model can't
+ * loop forever — its second attempt is accepted either way.
  */
 export async function sendAgentMessage(
   chat: ChatSession,
@@ -820,19 +857,25 @@ export async function sendAgentMessage(
   onTextDelta?: (textSoFar: string) => void,
   contextSummary?: string,
   guardrail?: (content: string) => string | undefined,
+  formatGuardrail?: { shouldArm: () => boolean; check: (content: string) => string | undefined },
 ): Promise<string> {
   chat.messages.push({ role: 'user', content: message });
 
   let guard = 0;
   let forcedToolName: string | undefined;
+  let extraNote: string | undefined;
   let guardrailRetried = false;
   let guardrailArmed = Boolean(guardrail);
+  let formatRetried = false;
   while (guard < 6) {
     guard += 1;
-    const requestMessages = buildRequestMessages(chat.messages, contextSummary);
+    const requestMessages = buildRequestMessages(chat.messages, contextSummary, extraNote);
+    extraNote = undefined; // one-shot — only ever applies to the single retry request it was set for
 
+    const formatArmedThisAttempt = !formatRetried && Boolean(formatGuardrail?.shouldArm());
+    const bufferingThisAttempt = guardrailArmed || formatArmedThisAttempt;
     let buffered = '';
-    const deltaSink = guardrailArmed
+    const deltaSink = bufferingThisAttempt
       ? (textSoFar: string) => {
           buffered = textSoFar;
         }
@@ -854,10 +897,23 @@ export async function sendAgentMessage(
       }
     }
 
-    if (guardrailArmed) {
-      onTextDelta?.(buffered || content);
-      guardrailArmed = false; // this customer message's guarded window is over either way — text-only or tool-backed, later rounds in this same exchange stream live as normal
+    if (formatArmedThisAttempt && toolCalls.length === 0) {
+      const correction = formatGuardrail!.check(content);
+      if (correction) {
+        formatRetried = true;
+        console.warn(
+          `[llmProvider] format guardrail: ${servedBy}'s reply didn't match the required option-list format — discarding and forcing a reformat`,
+          { content },
+        );
+        extraNote = correction;
+        continue;
+      }
     }
+
+    if (bufferingThisAttempt) {
+      onTextDelta?.(buffered || content);
+    }
+    guardrailArmed = false; // this customer message's tool-guardrail window is over either way — text-only or tool-backed, later rounds in this same exchange stream live as normal
 
     if (toolCalls.length > 0) {
       chat.messages.push({ role: 'assistant', content: content || null, tool_calls: toolCalls });

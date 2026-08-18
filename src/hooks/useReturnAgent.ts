@@ -275,16 +275,52 @@ const GUARDRAIL_TOOL_FOR_PENDING: Partial<Record<PendingQuestion, string>> = {
 /**
  * True for text that reads like a numbered options list (2+ list markers —
  * either the emoji numerals the prompts ask for, or a plain "1." style
- * fallback) — the shape a slots/sizes/items answer always takes, and NOT
- * the shape most other replies take. A single incidental number doesn't
- * count; a genuine list of options does. Deliberately generic (doesn't
- * know or care whether the list is slots, sizes, or items) — the caller
- * already knows which one is pending, this only answers "does this text
- * look like *a* list."
+ * fallback) — the shape a slots/sizes/items answer always takes on chat,
+ * and NOT the shape most other replies take. A single incidental number
+ * doesn't count; a genuine list of options does. Deliberately generic
+ * (doesn't know or care whether the list is slots, sizes, or items) — the
+ * caller already knows which one is pending, this only answers "does this
+ * text look like *a* numbered list."
+ *
+ * Used two ways, not just one: buildOptionsListGuardrail below reuses it to
+ * catch a SUSPICIOUS list (one that wasn't actually backed by a tool call);
+ * buildListFormatGuardrail reuses the exact same check the other direction,
+ * to CONFIRM a chat reply that's supposed to present options actually did
+ * so as a numbered list rather than bullets or bare prose — same shape
+ * either way, just judged for a different purpose.
  */
-function looksLikeFabricatedOptionsList(text: string): boolean {
+function looksLikeNumberedList(text: string): boolean {
   const markers = text.match(/[1-9]️?⃣|\b[1-9]\./g) ?? [];
   return markers.length >= 2;
+}
+
+/**
+ * Voice's equivalent of looksLikeNumberedList — voiceSystemPrompt.ts
+ * explicitly bans numbered-list glyphs/emoji/bullets ("no markdown,
+ * asterisks, emoji, bullets, or numbered-list symbols. Present options as
+ * natural speech"), so the emoji/dot-numeral markers above would NEVER
+ * appear in a voice reply by design; checking for them here would just
+ * make every voice options reply fail forever. What voice uses instead,
+ * per that same prompt's own example ("the first slot is... the second is
+ * ..."), is spoken ordinals — so this checks for two or more of those
+ * instead of numeral markers.
+ *
+ * Deliberately does NOT also accept bare digits ("1", "2") the way
+ * fullNumeral does elsewhere in this file — those helpers parse the
+ * CUSTOMER's spoken reply, where a bare digit is exactly what
+ * SpeechRecognition renders a spoken number as. This function checks the
+ * AGENT's own generated text instead, where a bare digit is far more
+ * likely incidental (a price, a date, a time like "3 PM") than a genuine
+ * ordinal signpost — confirmed live: a pickup-slot reply structured as
+ * "the first slot is... Or I also have Thursday... Or Friday..." (only
+ * ONE real ordinal, never actually numbering the 2nd/3rd slots) still
+ * passed a digit-inclusive version of this check, because two unrelated
+ * "3 PM" mentions supplied the second "marker" — the exact false pass
+ * this function exists to prevent.
+ */
+function looksLikeOrdinalSpeech(text: string): boolean {
+  const markers = text.match(/\b(first|second|third|fourth|1st|2nd|3rd|4th)\b/gi) ?? [];
+  return new Set(markers.map((m) => m.toLowerCase())).size >= 2;
 }
 
 /**
@@ -300,7 +336,77 @@ function buildOptionsListGuardrail(facts: ConversationFacts): ((content: string)
   const pending = currentPendingQuestion(facts);
   const requiredTool = pending ? GUARDRAIL_TOOL_FOR_PENDING[pending] : undefined;
   if (!requiredTool) return undefined;
-  return (content: string) => (looksLikeFabricatedOptionsList(content) ? requiredTool : undefined);
+  return (content: string) => (looksLikeNumberedList(content) ? requiredTool : undefined);
+}
+
+/**
+ * Builds sendAgentMessage's `formatGuardrail` argument — enforces that
+ * whenever the agent presents item/reason/size/slot options, it does so
+ * with a numbered format the customer can reliably reply to with a digit.
+ * Reasons need this most: REASON_BY_DIGIT only trusts a bare numeral when
+ * looksLikeNumberedList already confirms a numbered menu was actually
+ * shown (see captureNextReply) — before this guardrail, that menu was
+ * observed live rendered three different ways across otherwise-identical
+ * runs (numbered emoji, bullets, plain prose), so a numeral reply worked
+ * only by the model's own comprehension, not by any code-level guarantee.
+ * item/slot don't strictly need this the same way (they resolve a numeral
+ * positionally against the real data regardless of how it was presented),
+ * but consistent numbering is requested for all of them anyway, purely for
+ * a predictable customer experience.
+ *
+ * Unlike buildOptionsListGuardrail (computed once, checked only against
+ * the turn's first reply), `shouldArm` here is called by sendAgentMessage
+ * at the top of EVERY loop iteration and reads `facts` fresh each time —
+ * required because a list-backed question routinely only becomes pending
+ * partway through a turn's own tool calls (e.g. the reason menu doesn't
+ * exist to check until AFTER checkReturnEligibility has already run this
+ * same turn), so a once-only check would structurally always miss it.
+ * `count >= 2` skips arming when there's nothing worth numbering (e.g.
+ * exactly one exchange size in stock) — a "numbered list of one" reads
+ * oddly and isn't what any of this is for.
+ *
+ * `check` additionally requires PENDING_QUESTION_KEYWORDS[pending] to
+ * match the reply before treating a missing number as a violation — the
+ * same relevance gate captureNextReply itself uses, and for the same
+ * reason: `pending` being 'reason' doesn't mean THIS particular reply is
+ * the one presenting the reason menu (it might be confirming a detail, or
+ * asking about seal condition first) — without this, an unrelated reply
+ * would get wrongly discarded and forced through an unnecessary reformat
+ * it was never supposed to contain a list in the first place.
+ *
+ * `channel` picks the right positive check and corrective wording: chat
+ * enforces numbered emoji (looksLikeNumberedList, matching chat's own
+ * "Numbered emoji for option lists" rule); voice enforces spoken ordinals
+ * (looksLikeOrdinalSpeech) instead, since voiceSystemPrompt.ts explicitly
+ * bans numbered-list glyphs/emoji outright — asking a voice reply to add
+ * "1️⃣" would directly contradict its own system prompt.
+ */
+function buildListFormatGuardrail(
+  facts: ConversationFacts,
+  channel: 'chat' | 'voice',
+): { shouldArm: () => boolean; check: (content: string) => string | undefined } {
+  const isWellFormatted = channel === 'voice' ? looksLikeOrdinalSpeech : looksLikeNumberedList;
+
+  const pendingWithOptions = (): PendingQuestion | undefined => {
+    const pending = currentPendingQuestion(facts);
+    if (!pending) return undefined;
+    const count = pendingOptionCount(facts, pending);
+    return count !== undefined && count >= 2 ? pending : undefined;
+  };
+
+  return {
+    shouldArm: () => pendingWithOptions() !== undefined,
+    check: (content: string) => {
+      const pending = pendingWithOptions();
+      if (!pending) return undefined;
+      if (!PENDING_QUESTION_KEYWORDS[pending].test(content)) return undefined;
+      if (isWellFormatted(content)) return undefined;
+      const label = PENDING_QUESTION_LABEL[pending];
+      return channel === 'voice'
+        ? `Your last reply presented ${label} without clearly ordering them. Rewrite that reply, presenting the exact same options and content in the exact same order, but using natural spoken ordinals ("the first option is... the second is...") so the customer can reply with a number. Do not call any tool again — just rephrase.`
+        : `Your last reply presented ${label} without a numbered list. Rewrite that reply, presenting the exact same options and content in the exact same order, but as a numbered emoji list (1️⃣ 2️⃣ 3️⃣...) so the customer can reply with a number. Do not call any tool again — just reformat.`;
+    },
+  };
 }
 
 // The exact digit order step 3 of the system prompt declares ("map their
@@ -563,7 +669,7 @@ const ORDER_ID_REASK_PATTERN = /order id.{0,25}phone number/i;
  * rejecting a numeral that may be answering something else entirely off
  * the state machine's radar. For 'reason' specifically, a bare numeral
  * only means anything if the reason menu was actually presented as a
- * numbered list — see looksLikeFabricatedOptionsList, reused here for
+ * numbered list — see looksLikeNumberedList, reused here for
  * exactly the property it was built to detect.
  */
 function validatePendingChoice(facts: ConversationFacts, incomingMessage: string, lastAgentText: string): string | undefined {
@@ -572,7 +678,7 @@ function validatePendingChoice(facts: ConversationFacts, incomingMessage: string
   if (!PENDING_QUESTION_KEYWORDS[pending].test(lastAgentText) || ORDER_ID_REASK_PATTERN.test(lastAgentText)) return undefined;
   const n = fullNumeral(incomingMessage);
   if (n === null) return undefined;
-  if (pending === 'reason' && !looksLikeFabricatedOptionsList(lastAgentText)) return undefined;
+  if (pending === 'reason' && !looksLikeNumberedList(lastAgentText)) return undefined;
   const count = pendingOptionCount(facts, pending);
   if (count === undefined || (n >= 1 && n <= count)) return undefined;
   const label = PENDING_QUESTION_LABEL[pending];
@@ -683,10 +789,10 @@ function captureNextReply(facts: ConversationFacts, incomingMessage: string, las
     const n = fullNumeral(trimmed);
     if (n !== null) {
       // A bare number only means anything if the menu was actually
-      // numbered (see looksLikeFabricatedOptionsList) — otherwise it's not
+      // numbered (see looksLikeNumberedList) — otherwise it's not
       // a list index, and storing it as literal "reason" text would be
       // just as wrong as mapping it to the wrong option.
-      if (!looksLikeFabricatedOptionsList(lastAgentText)) return;
+      if (!looksLikeNumberedList(lastAgentText)) return;
       const mapped = REASON_BY_DIGIT[String(n)];
       if (!mapped) return; // out of range — validatePendingChoice should already have caught this
       facts.reason = mapped;
@@ -793,6 +899,19 @@ function factsToSummary(f: ConversationFacts): string {
  * numbered, and "1" is correct there too, so order doesn't actually
  * matter between those two — kept separate for clarity, not behavior).
  *
+ * The item rule is the same idea, added after the same failure mode hit a
+ * genuinely multi-item order (WellNest's WN2001, Digital BP Monitor +
+ * Vitamin D3 Tablets): "which item would you like to return" doesn't
+ * always come back numbered with emoji the way a reason/slot list does —
+ * the model sometimes just asks in plain prose — so it fell through every
+ * rule above, including the numbered-emoji one, straight to the generic
+ * "yes, please go ahead" fallback, which answers nothing and stalled the
+ * setup loop for its full 4 rounds. "1" resolves it correctly either way:
+ * captureNextReply's 'item' branch maps a bare numeral positionally
+ * against the order's own item list (facts.pendingItemOptions), not
+ * against however the agent happened to format its question, so this
+ * works whether the agent listed the items with 1️⃣2️⃣ or not.
+ *
  * `orderId`, when available (see playScenario, which extracts it from the
  * scenario's own opener), is repeated verbatim rather than a vague "I
  * already gave it" — also seen live to matter: a vague nudge sometimes
@@ -801,6 +920,7 @@ function factsToSummary(f: ConversationFacts): string {
  */
 function pickSetupReply(lastAgentText: string, orderId?: string): string {
   const rules: { matches: RegExp; reply: string }[] = [
+    { matches: /which (item|one|product)/i, reply: '1' },
     { matches: /slot|pickup|which time|available time/i, reply: '1' },
     { matches: /reason|why.*(want|return)|what happened/i, reply: "I've changed my mind, I just don't need it anymore" },
     { matches: /order id|phone number/i, reply: orderId ? `The order ID is ${orderId}` : 'I gave the order ID already, please check above' },
@@ -808,6 +928,37 @@ function pickSetupReply(lastAgentText: string, orderId?: string): string {
   ];
   const rule = rules.find((r) => r.matches.test(lastAgentText));
   return rule ? rule.reply : 'yes, please go ahead';
+}
+
+/**
+ * The agent's actual last line, read from the LLM-facing conversation log
+ * (a ChatSession's own `messages`) rather than the UI transcript. Those
+ * used to be treated as interchangeable — sendChatMessage/sendVoiceMessage
+ * read a `chatMessagesRef`/`callMessagesRef` that mirrored React state via
+ * a `useEffect` — but that mirror only updates after a render commit, not
+ * synchronously with the state update that triggered it. playScenario's
+ * setup loop fires its next scripted reply the instant the previous
+ * `send()` resolves, no delay, which can outrun that effect:
+ * captureNextReply/validatePendingChoice would then evaluate the
+ * customer's reply against the PREVIOUS agent turn's message instead of
+ * the one it's actually answering, and silently fail to capture it.
+ * Confirmed live on a genuinely multi-item order (WellNest's WN2001): a
+ * correctly-generated numeral reply to "which item" still didn't resolve,
+ * because the pending-question gate was checking it against an older
+ * message. `session.messages` has no such lag — it's a plain ref, mutated
+ * synchronously by sendAgentMessage (see llmProvider.ts) the moment a
+ * reply is produced, with no React render/commit in between. A real,
+ * interactively-typing customer never hits this: there's always human
+ * reading-and-typing time between turns, which is exactly why it only ever
+ * showed up in the automated scripted-replay path.
+ */
+function lastAssistantText(session: ChatSession | null): string {
+  if (!session) return '';
+  for (let i = session.messages.length - 1; i >= 0; i -= 1) {
+    const message = session.messages[i];
+    if (message.role === 'assistant') return message.content ?? '';
+  }
+  return '';
 }
 
 export function useReturnAgent() {
@@ -1042,14 +1193,6 @@ export function useReturnAgent() {
   const [chatStreamingText, setChatStreamingText] = useState('');
   const chatSessionRef = useRef<ChatSession | null>(null);
   const chatFactsRef = useRef<ConversationFacts>({});
-  // Synchronous mirror of chatMessages (React state updates aren't visible
-  // until the next render) — needed so sendChatMessage can read the agent's
-  // actual last line before deciding what the customer's reply answers
-  // (see captureNextReply/validatePendingChoice's lastAgentText parameter).
-  const chatMessagesRef = useRef<ChatMessage[]>([]);
-  useEffect(() => {
-    chatMessagesRef.current = chatMessages;
-  }, [chatMessages]);
 
   if (!chatSessionRef.current && !apiKeyMissing) {
     chatSessionRef.current = newSession(buildSystemInstruction(brand));
@@ -1062,8 +1205,10 @@ export function useReturnAgent() {
 
       // Captured before this turn's own state updates land, so it's
       // unambiguously the agent's PRIOR line — what the customer's reply
-      // below is actually answering (see PENDING_QUESTION_KEYWORDS).
-      const lastAgentText = [...chatMessagesRef.current].reverse().find((m) => m.role === 'agent')?.text ?? '';
+      // below is actually answering (see PENDING_QUESTION_KEYWORDS and
+      // lastAssistantText's own doc for why this reads chatSessionRef
+      // rather than the UI transcript).
+      const lastAgentText = lastAssistantText(chatSessionRef.current);
 
       setChatMessages((prev) => [...prev, { id: uid(), role: 'user', text: trimmed, timestamp: Date.now() }]);
 
@@ -1095,6 +1240,7 @@ export function useReturnAgent() {
           (textSoFar) => setChatStreamingText(textSoFar),
           factsToSummary(chatFactsRef.current),
           buildOptionsListGuardrail(chatFactsRef.current),
+          buildListFormatGuardrail(chatFactsRef.current, 'chat'),
         );
         setChatMessages((prev) => [...prev, { id: uid(), role: 'agent', text: reply, timestamp: Date.now() }]);
         return reply;
@@ -1216,8 +1362,9 @@ export function useReturnAgent() {
       if (!trimmed || apiKeyMissing || !voiceSessionRef.current || !callActive) return undefined;
 
       // See sendChatMessage's identical capture — the agent's PRIOR line,
-      // before this turn's own state updates land.
-      const lastAgentText = [...callMessagesRef.current].reverse().find((m) => m.role === 'agent')?.text ?? '';
+      // read from voiceSessionRef rather than the UI transcript (see
+      // lastAssistantText's own doc for why).
+      const lastAgentText = lastAssistantText(voiceSessionRef.current);
 
       setCallMessages((prev) => [...prev, { id: uid(), role: 'user', text: trimmed, timestamp: Date.now() }]);
 
@@ -1250,6 +1397,7 @@ export function useReturnAgent() {
           (textSoFar) => setVoiceStreamingText(textSoFar),
           factsToSummary(voiceFactsRef.current),
           buildOptionsListGuardrail(voiceFactsRef.current),
+          buildListFormatGuardrail(voiceFactsRef.current, 'voice'),
         );
         setCallMessages((prev) => [...prev, { id: uid(), role: 'agent', text: reply, timestamp: Date.now() }]);
         speakAgentLine(reply);
